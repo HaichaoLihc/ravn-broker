@@ -1,0 +1,2289 @@
+openapi: 3.1.0
+info:
+  title: RAVN Headless Broker API
+  version: 0.3.0-design
+  summary: Proposed MCP-first broker; REST management and alternative calls, with optional policy extensions.
+  description: |
+    DESIGN CONTRACT ONLY. This specification is a proposal for the headless RAVN
+    v1 implementation. It does not describe a shipping or integration-tested API.
+    The proposed server is Python/FastAPI with the official Python MCP SDK,
+    one Uvicorn worker, and SQLite; this HTTP contract is language-independent.
+
+    MCP-FIRST DELIVERY. REST manages account onboarding, connection lifecycle,
+    runtime-session issuance/revocation, and core metadata-only activity listing. Agents primarily
+    discover and call tools through /mcp using connection-bound session tokens.
+    REST discovery/execution remains a supported backend alternative through the
+    SAME authorization/execution engine; developers need not integrate both call
+    paths. Connecting an account is setup, not something an agent repeats per
+    call. Runtime-token expiry does not disconnect the provider account.
+    Personal bearer import supports development and intentional bring-your-own-
+    token deployments; GitHub App user OAuth is the default onboarding profile.
+    Fine-grained policy PATCH and events queries are OPTIONAL EXTENSIONS.
+    No permanent agent registration or duplicate permission editor is required.
+
+    RAVN authenticates an application credential and derives app_id from that
+    credential. Every /v1 request must also supply X-Ravn-User-Id. Configured
+    multi-tenant applications MUST supply X-Ravn-Tenant-Id; configured single-
+    tenant applications may omit it and resolve to the literal default tenant.
+    In single mode, explicitly supplying default is allowed; other tenant values
+    are rejected. In multi mode, missing/empty tenant is rejected, never defaulted.
+    The trusted application backend obtains those identifiers
+    from its own verified login/session, not model output or an unverified
+    request body. RAVN trusts that backend to assert identities inside its own
+    application namespace; this is not independent end-user authentication. An
+    app key can act for any user in that application, so it stays in the trusted
+    backend. It is not an individual agent identity or a deployment-admin key.
+
+    Connection ownership, explicit service-connection ACLs, tenant isolation,
+    application integration access, credential audience, and current lifecycle
+    state are mandatory checks. Additional tool/resource restrictions are
+    optional and cannot expand the external provider's permissions.
+
+    Integrations, applications, application credentials, service-owned vault
+    bindings, and service-connection user ACLs are operator configuration,
+    managed through configuration files and the CLI. They have no CRUD API here.
+    The personal credential import endpoint never accepts arbitrary vault paths.
+
+    The separate /mcp endpoint accepts connection-bound runtime session tokens,
+    not application credentials. It implements MCP, not this REST API, and is
+    deliberately not modeled as a JSON-RPC-shaped REST operation here. No OAuth
+    authorization server, dynamic client registration, agent registry, dashboard,
+    or recursive subagent delegation is implied by this contract.
+
+    All production traffic uses TLS. Raw credentials, OAuth completion codes,
+    authorization URLs, tool arguments/results, and unsanitized upstream errors
+    must not be recorded in default access or audit logs. Tool results are
+    returned on the live call but are not persisted by default. Activity includes
+    tool, status, timing, session provenance, and a keyed argument fingerprint,
+    not raw arguments or results. It cannot reconstruct a comment's contents.
+servers:
+  - url: https://ravn.example.com
+    description: Example production deployment; replace with your RAVN origin.
+  - url: http://127.0.0.1:8787
+    description: Loopback development only; do not expose without TLS.
+security:
+  - ApplicationCredential: []
+tags:
+  - name: Connect sessions
+    description: Core workflow. User-owned OAuth onboarding and same-account reconnection.
+  - name: Connections
+    description: Core account bindings without credential disclosure; policy PATCH is an optional extension.
+  - name: Calls
+    description: Core activity listing/status plus a REST execution alternative; MCP is the primary agent interface.
+  - name: Runtime sessions
+    description: Core MCP access. Backend creates a short-lived connection-bound credential; agent uses it only on /mcp. Not required for REST execution.
+  - name: Events
+    description: OPTIONAL EXTENSION. Queryable sanitized audit metadata; structured server logs suffice for the first milestone.
+  - name: Health
+    description: Non-sensitive unauthenticated process and readiness checks.
+x-ravn-design-notes:
+  - Application identity is never accepted from actor headers or request bodies.
+  - All scoped object lookups use app_id, resolved tenant_id, user_id, and object authorization.
+  - Tenant mode is operator configuration; data is never implicitly remapped between single and multi modes.
+  - Runtime sessions are core for MCP; provider connection setup and token renewal are trusted backend operations.
+  - MCP uses the same executor as REST but independently authenticates the session bearer.
+  - An inaccessible or foreign object returns 404; insufficient rights on an accessible object return 403.
+  - Empty restrictions objects normalize to null; an empty tools array explicitly denies all tools.
+  - Reconnect preserves the verified provider account identity and never silently switches accounts.
+  - Reconnection and permission/lifecycle changes can invalidate runtime sessions through connection epoch changes.
+  - Disconnect/revoke applies before subsequent dispatch, not retroactively to completed or in-flight upstream work.
+  - Idempotency-Key is optional for all MVP REST tool calls, including reviewed writes; keyless resubmissions may execute again.
+  - MCP clients may optionally use params._meta["ravn/idempotency-key"]; this RAVN extension is consumed locally, not forwarded upstream.
+  - Ordinary tested MCP clients can write without per-call headers; untrusted tool hints never prove a read safe to retry.
+  - Runtime sessions default to one hour, allow 60-14400 seconds within configured limits, and reject rather than shorten excessive requested TTLs.
+  - GitHub App user-token compatibility must be proved before broker implementation; this document does not claim that test has passed.
+  - Local deduplication does not guarantee exactly-once execution across arbitrary upstream services.
+  - Unknown upstream outcomes are not automatically retried.
+paths:
+  /healthz:
+    get:
+      operationId: getHealth
+      tags: [Health]
+      summary: Check that the process can serve a basic request.
+      description: Does not enumerate configuration, dependencies, accounts, or credentials.
+      security: []
+      responses:
+        '200':
+          description: Process is running.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+              example:
+                status: ok
+  /readyz:
+    get:
+      operationId: getReadiness
+      tags: [Health]
+      summary: Check whether the instance is ready to accept work.
+      description: |
+        Readiness checks required local dependencies and configuration without
+        testing every external provider on every request. It does not reveal
+        dependency addresses, secret-store paths, or sensitive diagnostics.
+      security: []
+      responses:
+        '200':
+          description: Ready to accept work.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+              example:
+                status: ok
+        '503':
+          description: Instance is not ready.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReadinessFailure'
+              example:
+                status: not_ready
+  /v1/connections/{connection_id}/tool-schemas:
+    parameters:
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/UserId'
+      - $ref: '#/components/parameters/ConnectionId'
+    get:
+      operationId: inspectConnectionToolSchemas
+      tags: [Connections]
+      summary: Inspect candidate read-tool schemas with a stored credential, without approving them.
+      description: |
+        Implemented in milestone 2. Application-authenticated, actor-owned read.
+        Returns only reviewed-name candidates and their schema hashes. Does not
+        expose provider credentials, change pins, or authorize additional tools.
+      responses:
+        '200':
+          description: Candidate schemas for explicit operator review.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [schema_hashes, schemas_for_review]
+                properties:
+                  schema_hashes:
+                    type: object
+                    additionalProperties:
+                      type: string
+                      pattern: '^[a-f0-9]{64}$'
+                  schemas_for_review:
+                    type: object
+                    additionalProperties:
+                      type: object
+                      properties:
+                        input:
+                          type: object
+                        output:
+                          type: [object, 'null']
+        '404':
+          description: Connection not found in the authenticated actor's namespace.
+
+  /v1/connect-sessions:
+    parameters:
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/UserId'
+    post:
+      operationId: startConnectSession
+      tags: [Connect sessions]
+      summary: Start a user-owned OAuth connection or reconnect transaction.
+      description: |
+        The authenticated actor becomes the connection owner. The integration
+        must be enabled for the application and support OAuth. return_url must
+        exactly match an operator-approved application return URL; wildcard,
+        suffix, or attacker-controlled redirects are not accepted.
+
+        app_state is an opaque application-generated transaction value. The
+        application stores it against the initiating user's browser/login
+        transaction and verifies it before completing the flow. Do not encode
+        personal data or secrets in it. RAVN independently manages provider OAuth
+        state and PKCE where supported/required; app_state does not replace them.
+
+        The whole authorization transaction expires after 10 minutes. After a
+        validated provider callback, credentials are staged until the earlier
+        of callback time plus 5 minutes and the original transaction expiry;
+        staging never extends the original 10-minute lifetime. A single-use
+        completion_code is delivered only through the
+        browser return to the approved return_url, together with app_state and
+        the connect-session identifier. Credentials are not committed until the
+        application backend calls complete. GET status never returns that code.
+
+        For reconnect, the existing connection must belong to this actor and use
+        this integration. Its previously verified provider account/workspace
+        identity must match the new authorization. A different account requires
+        a new connection. A failed or cancelled attempt leaves the old connection
+        and its credentials unchanged. OAuth grants remain provider-controlled;
+        app-defined RAVN restrictions are configured separately.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StartConnectSessionRequest'
+            examples:
+              newConnection:
+                value:
+                  integration_id: github
+                  return_url: https://app.example.com/settings/connections/return
+                  app_state: xQM2Tt90y7iueS9svXq9I2UluMX8ev11
+              reconnect:
+                value:
+                  integration_id: github
+                  return_url: https://app.example.com/settings/connections/return
+                  app_state: eDBvfLxLBcAKeqTrDoznCEsAZcv9AH3M
+                  reconnect_connection_id: conn_01K4ZAZBR1KQEM19YEJGJ3RF5P
+      responses:
+        '201':
+          description: Pending OAuth transaction created.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+            Location:
+              description: Actor-authorized status endpoint for the new transaction.
+              schema:
+                type: string
+              example: /v1/connect-sessions/cs_01K4ZAZBR1KQEM19YEJGJ3RF5P
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreatedConnectSession'
+              example:
+                id: cs_01K4ZAZBR1KQEM19YEJGJ3RF5P
+                status: pending
+                authorization_url: https://ravn.example.com/connect/cs_01K4ZAZBR1KQEM19YEJGJ3RF5P/start
+                expires_at: '2026-09-11T20:10:00Z'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        default:
+          $ref: '#/components/responses/Error'
+  /v1/connect-sessions/{connect_session_id}:
+    parameters:
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/UserId'
+      - $ref: '#/components/parameters/ConnectSessionId'
+    get:
+      operationId: getConnectSession
+      tags: [Connect sessions]
+      summary: Read onboarding status without receiving a completion code or credentials.
+      description: |
+        Only the originating application/tenant/user context can read the
+        transaction. This endpoint does not return authorization_url,
+        completion_code, provider authorization codes, tokens, or OAuth state.
+        connection_id is populated only after successful completion.
+      responses:
+        '200':
+          description: Current sanitized transaction status.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConnectSession'
+              example:
+                id: cs_01K4ZAZBR1KQEM19YEJGJ3RF5P
+                integration_id: github
+                status: awaiting_completion
+                expires_at: '2026-09-11T20:10:00Z'
+                completion_expires_at: '2026-09-11T20:08:00Z'
+                connection_id: null
+                created_at: '2026-09-11T20:00:00Z'
+                updated_at: '2026-09-11T20:03:00Z'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        default:
+          $ref: '#/components/responses/Error'
+  /v1/connect-sessions/{connect_session_id}/complete:
+    parameters:
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/UserId'
+      - $ref: '#/components/parameters/ConnectSessionId'
+    post:
+      operationId: completeConnectSession
+      tags: [Connect sessions]
+      summary: Commit staged credentials after verifying the original application transaction.
+      description: |
+        Before calling this endpoint, the application must match the returned
+        connect-session ID and app_state to its original server-side browser
+        transaction and authenticated user. Merely accepting a flow identifier
+        submitted by any logged-in browser is not sufficient.
+
+        completion_code arrives only through the browser return. It is
+        short-lived, single-use, bound to this transaction and actor, and stored
+        only as a verifier/hash by RAVN. Validate and consume it atomically with
+        the connection commit. Replaying it returns completion_code_invalid.
+        If the application loses a successful response, it can read the status
+        endpoint to recover the committed connection_id without reusing the code.
+
+        Same-account reconnect atomically replaces the active credential and
+        invalidates older runtime sessions by incrementing connection epoch.
+        Pending credentials and codes are destroyed after expiry/cancellation.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CompleteConnectSessionRequest'
+      responses:
+        '200':
+          description: Connection committed; no credentials are returned.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+            ETag:
+              $ref: '#/components/headers/ConnectionETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Connection'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        default:
+          $ref: '#/components/responses/Error'
+  /v1/connect-sessions/{connect_session_id}/cancel:
+    parameters:
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/UserId'
+      - $ref: '#/components/parameters/ConnectSessionId'
+    post:
+      operationId: cancelConnectSession
+      tags: [Connect sessions]
+      summary: Cancel pending onboarding and destroy staged credentials.
+      description: |
+        Cancellation is locally idempotent for an already-cancelled or expired
+        transaction. A completed flow cannot be undone here; use connection
+        disconnect. A reconnect cancellation does not disable the existing
+        connection. Provider-side revocation of any staged grant is best effort
+        and cannot be assumed to revoke unrelated provider grants.
+      responses:
+        '204':
+          description: Cancelled, or already inactive without a committed connection.
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        default:
+          $ref: '#/components/responses/Error'
+  /v1/connections/import:
+    parameters:
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/UserId'
+    post:
+      operationId: importPersonalConnection
+      tags: [Connections]
+      summary: Import a personal bearer credential for a configured integration.
+      description: |
+        Creates a user-owned connection for the asserted authenticated actor.
+        The integration must explicitly permit personal bearer-token import and
+        provide a safe account-identity validation mechanism. RAVN validates the
+        credential against the registered provider destination, derives verified
+        provider_account_id, and stores the credential through its configured
+        secret store. It never echoes the credential.
+
+        This endpoint cannot select another owner, create service-owned
+        connections, set arbitrary request headers/destinations, or resolve
+        caller-supplied vault references. Operator-configured service credentials
+        use a separate configuration path with explicit user ACLs.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ImportConnectionRequest'
+            example:
+              integration_id: github
+              credential:
+                type: bearer
+                token: EXAMPLE_TOKEN_REPLACE_OUTSIDE_SOURCE_CONTROL
+              label: Alice GitHub
+      responses:
+        '201':
+          description: Verified personal connection created.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+            ETag:
+              $ref: '#/components/headers/ConnectionETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Connection'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '502':
+          $ref: '#/components/responses/BadGateway'
+        default:
+          $ref: '#/components/responses/Error'
+  /v1/connections:
+    parameters:
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/UserId'
+    get:
+      operationId: listConnections
+      tags: [Connections]
+      summary: List personal connections and explicitly authorized service connections.
+      description: |
+        The collection is scoped to the authenticated application, asserted
+        tenant/user, and explicit connection authorization. Same-tenant membership
+        alone does not expose a service-owned connection. Cursor state is bound
+        to this actor and filter set. Results include metadata only.
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - name: integration_id
+          in: query
+          schema:
+            $ref: '#/components/schemas/IntegrationId'
+      responses:
+        '200':
+          description: A bounded page of authorized connections.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConnectionPage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        default:
+          $ref: '#/components/responses/Error'
+  /v1/connections/{connection_id}:
+    parameters:
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/UserId'
+      - $ref: '#/components/parameters/ConnectionId'
+    get:
+      operationId: getConnection
+      tags: [Connections]
+      summary: Read authorized connection metadata and its current revision.
+      responses:
+        '200':
+          description: Connection metadata; secret references and tokens are omitted.
+          headers:
+            ETag:
+              $ref: '#/components/headers/ConnectionETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Connection'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        default:
+          $ref: '#/components/responses/Error'
+    patch:
+      operationId: updateConnection
+      x-ravn-phase: optional-extension
+      tags: [Connections]
+      summary: '[Optional extension] Change a personal connection label or supported restrictions.'
+      description: |
+        This endpoint is not required for the minimal first milestone. The core
+        still enforces ownership and connection access without additional
+        fine-grained restrictions. Add this endpoint when configurable narrowing
+        becomes a validated requirement.
+
+        Changes are conditional on the quoted revision in If-Match. A stale
+        revision returns 412 without applying any part of the patch. Missing
+        If-Match returns 428. At least one supported field must be present.
+
+        Omitted properties remain unchanged. restrictions:null removes optional
+        connection-level restrictions only where allowed by operator/application
+        policy; it does not remove mandatory ownership checks or operator limits.
+        An empty restrictions object normalizes to null. Empty tools denies all.
+        Unsupported resource restrictions are rejected rather than silently
+        ignored. Permission changes increment epoch and invalidate older runtime
+        sessions; label-only changes increment revision, not epoch.
+
+        This API cannot change integration, owner, tenant, provider identity,
+        credentials, or operator-managed service-connection ACLs. A user allowed
+        to execute a service connection is not automatically allowed to edit it.
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateConnectionRequest'
+            examples:
+              readOnlyRepository:
+                value:
+                  restrictions:
+                    tools: [list_issues, issue_read]
+                    resources:
+                      repositories: [acme/backend]
+              removeOptionalRestrictions:
+                value:
+                  restrictions: null
+      responses:
+        '200':
+          description: Updated connection and new revision.
+          headers:
+            ETag:
+              $ref: '#/components/headers/ConnectionETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Connection'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '412':
+          description: Connection revision changed; fetch metadata before retrying the edit.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+              example:
+                error:
+                  code: revision_conflict
+                  message: Connection revision changed. Read the connection before retrying.
+                  request_id: req_01K4ZAZBR1KQEM19YEJGJ3RF5P
+                  retryable: false
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '428':
+          description: A quoted If-Match revision is required.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        default:
+          $ref: '#/components/responses/Error'
+  /v1/connections/{connection_id}/disconnect:
+    parameters:
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/UserId'
+      - $ref: '#/components/parameters/ConnectionId'
+    post:
+      operationId: disconnectConnection
+      tags: [Connections]
+      summary: Disable a personal connection and invalidate its runtime sessions.
+      description: |
+        Commit local disabled state and increment epoch before acknowledging.
+        Every subsequent call checks that state before dispatch. This operation
+        is locally idempotent and preserves an audit tombstone; it is not a
+        destructive metadata-delete endpoint.
+
+        Already-dispatched upstream operations may finish and are not undone.
+        Provider-side revocation is a distinct best-effort action, depending on
+        provider capability. Never claim global provider revocation when only
+        local disconnect succeeded. API callers cannot disconnect an
+        operator-managed service connection merely because they may execute it.
+      responses:
+        '200':
+          description: Local disconnect committed, with separate provider revocation status.
+          headers:
+            ETag:
+              $ref: '#/components/headers/ConnectionETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DisconnectResponse'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        default:
+          $ref: '#/components/responses/Error'
+  /v1/connections/{connection_id}/tools:
+    parameters:
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/UserId'
+      - $ref: '#/components/parameters/ConnectionId'
+    get:
+      operationId: listConnectionTools
+      tags: [Calls]
+      summary: Discover tools available through this authorized connection.
+      description: |
+        Returns registered/curated REST tools or discovered upstream MCP tools,
+        filtered by known tool restrictions. Discovery is not authorization to
+        call every resource: argument/resource policy and all current access
+        state are rechecked during execution. Tool descriptions, annotations,
+        and schemas are untrusted upstream data, not executable instructions or
+        a security proof. Do not infer safe retry behavior from MCP read-only
+        annotations alone.
+
+        v1 does not promise generic resource enforcement for arbitrary MCP tools.
+        A requested repository restriction requires connector-supported argument
+        validation and must reject tools that cannot be safely constrained.
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: A bounded page of tool definitions, without credentials.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ToolPage'
+              example:
+                data:
+                  - name: list_issues
+                    description: List issues in a repository.
+                    input_schema:
+                      type: object
+                      properties:
+                        owner:
+                          type: string
+                        repo:
+                          type: string
+                      required: [owner, repo]
+                    effect: read
+                    supported_resource_constraints: [repositories]
+                next_cursor: null
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '502':
+          $ref: '#/components/responses/BadGateway'
+        default:
+          $ref: '#/components/responses/Error'
+  /v1/connections/{connection_id}/calls:
+    parameters:
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/UserId'
+      - $ref: '#/components/parameters/ConnectionId'
+    post:
+      operationId: callConnectionTool
+      x-ravn-phase: core-alternative
+      tags: [Calls]
+      summary: Execute a tool using server-side credentials and current access checks.
+      description: |
+        A backend-mediated call needs an application credential plus the
+        authenticated tenant/user context; no agent registration or runtime
+        session token is necessary. The registered integration selects the
+        destination and auth-injection method. The request cannot supply a new
+        upstream URL, provider credential, or another user identity.
+
+        Idempotency-Key is optional for every MVP tool, including reviewed
+        GitHub writes. With a key, uniqueness is scoped to app/tenant/user and
+        its request fingerprint covers connection/tool/canonical arguments.
+        Reuse one key for retries of the same intended action, including across
+        runtime-token replacement; use a new key for a new action. Changed
+        content under the same key returns idempotency_conflict. A concurrent
+        keyed duplicate returns 202 without another dispatch.
+
+        Without a key, each submission is a new call and can execute again,
+        even with identical arguments. JSON-RPC IDs, argument fingerprints, and
+        server-generated call IDs are not automatic deduplication keys. All
+        admitted calls, keyed or keyless, receive a ledger record.
+
+        Initial live completion returns the MCP-like result. Default persistence
+        keeps sanitized outcome metadata, not raw results. A keyed replay of a
+        completed call can return the known outcome with result_available:false.
+        It must never re-execute merely to reproduce a discarded response.
+        Deduplication is limited to retained records (30 days by default), not
+        exactly-once upstream execution. Restoring an older database can lose
+        that history.
+
+        RAVN never automatically retries a potentially executed write, with or
+        without a key. If the outcome is unresolved, persist unknown and return
+        HTTP 502 with outcome_unknown, retryable:false, and call_id when a response
+        can be delivered. A process crash or lost connection may prevent delivery;
+        a missing response is also uncertain. A keyed unknown replay must not
+        dispatch again. Future provider-backed high-impact actions require a
+        separate design, not an exception to the MVP GitHub write rule.
+
+        A tool-level is_error response is HTTP 200 with status:tool_error and
+        preserved safe protocol content. It differs from local authorization
+        failure, provider reauthentication, and transport failure. Tool content is
+        untrusted data. Raw provider/auth error bodies must be sanitized before
+        they can become diagnostic error envelopes.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ToolCallRequest'
+            examples:
+              read:
+                value:
+                  tool: list_issues
+                  arguments:
+                    owner: acme
+                    repo: backend
+              commentWithoutRequiredKey:
+                summary: Authorized comments need no idempotency header; repeated submissions can duplicate the comment.
+                value:
+                  tool: add_issue_comment
+                  arguments:
+                    owner: acme
+                    repo: backend
+                    issue_number: 42
+                    body: I am investigating this issue.
+      responses:
+        '200':
+          description: Known tool outcome; a replay may not retain the original result.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+            Idempotency-Replayed:
+              $ref: '#/components/headers/IdempotencyReplayed'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CompletedCallResponse'
+              examples:
+                liveSuccess:
+                  value:
+                    call_id: call_01K4ZAZBR1KQEM19YEJGJ3RF5P
+                    status: succeeded
+                    result_available: true
+                    result:
+                      content:
+                        - type: text
+                          text: '{"issues":[]}'
+                      structured_content:
+                        issues: []
+                      is_error: false
+                completedReplayWithoutBody:
+                  value:
+                    call_id: call_01K4ZAZBR1KQEM19YEJGJ3RF5P
+                    status: succeeded
+                    result_available: false
+                toolError:
+                  value:
+                    call_id: call_01K4ZAZBR1KQEM19YEJGJ3RF5P
+                    status: tool_error
+                    result_available: true
+                    result:
+                      content:
+                        - type: text
+                          text: The requested issue could not be found.
+                      is_error: true
+        '202':
+          description: Same logical call is in progress; no duplicate was dispatched.
+          headers:
+            Location:
+              description: Actor-authorized status endpoint for the existing call.
+              schema:
+                type: string
+            Retry-After:
+              $ref: '#/components/headers/RetryAfter'
+            Idempotency-Replayed:
+              $ref: '#/components/headers/IdempotencyReplayed'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InProgressCallResponse'
+              example:
+                call_id: call_01K4ZAZBR1KQEM19YEJGJ3RF5P
+                status: running
+                result_available: false
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '502':
+          description: |
+            Upstream failure or an ambiguous execution outcome. Inspect the
+            stable error code, not HTTP status alone, before considering retry.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+              examples:
+                ambiguousWrite:
+                  value:
+                    error:
+                      code: outcome_unknown
+                      message: The upstream operation may have executed. Reconcile before retrying.
+                      request_id: req_01K4ZAZBR1KQEM19YEJGJ3RF5P
+                      retryable: false
+                      details:
+                        call_id: call_01K4ZAZBR1KQEM19YEJGJ3RF5P
+                        status: unknown
+                preDispatchUnavailable:
+                  value:
+                    error:
+                      code: upstream_unavailable
+                      message: The registered upstream service is unavailable.
+                      request_id: req_01K4ZAZBR1KQEM19YEJGJ3RF5P
+                      retryable: true
+        default:
+          $ref: '#/components/responses/Error'
+  /v1/calls:
+    parameters:
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/UserId'
+    get:
+      operationId: listCalls
+      x-ravn-phase: core
+      tags: [Calls]
+      summary: List a user's sanitized tool-call activity.
+      description: |
+        Uses the application credential and verified actor headers, never a runtime
+        token. Every row is constrained to the actor's app/tenant namespace.
+        Filters and known IDs confer no additional access. An inaccessible
+        connection/session filter reveals no foreign rows and may return an
+        empty page; do not query another namespace to explain its absence.
+
+        Return metadata only, even when result retention is enabled. Connection
+        disconnect and session expiry/revocation do not erase history visible to
+        a still-authorized owner. Service-owned extensions still apply current
+        ACLs. History is not permission to execute or replay a call.
+
+        First-page time interval is [created_from, created_before). Upper bound
+        defaults to server now; lower bound defaults to 24 hours before that
+        upper bound. Require UTC RFC 3339 timestamps and reject a future upper
+        bound, an empty/inverted range, or an interval longer than 30 days.
+        Retention may yield fewer records.
+
+        Sort newest first by (created_at, call_id). The opaque five-minute
+        keyset cursor binds the principal, normalized filters, page size, initial
+        upper bound, and last ordering key. On continuation, omitted filters/limit
+        reuse those values; supplied values must match. Expired/mismatched cursors
+        return 400 invalid_cursor. Call statuses may change between pages;
+        creation-time bounds do not promise a frozen database snapshot.
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - name: connection_id
+          in: query
+          schema:
+            $ref: '#/components/schemas/ResourceId'
+        - name: session_id
+          in: query
+          description: Originating runtime session, including expired/revoked sessions; REST calls have none.
+          schema:
+            $ref: '#/components/schemas/ResourceId'
+        - name: status
+          in: query
+          schema:
+            $ref: '#/components/schemas/CallStatus'
+        - name: created_from
+          in: query
+          description: Inclusive UTC creation time; defaults to 24 hours before the upper bound on page one.
+          schema:
+            type: string
+            format: date-time
+          example: '2026-09-10T00:00:00Z'
+        - name: created_before
+          in: query
+          description: Exclusive UTC creation time; defaults to server now on page one.
+          schema:
+            type: string
+            format: date-time
+          example: '2026-09-11T00:00:00Z'
+      responses:
+        '200':
+          description: Bounded metadata-only activity page.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CallPage'
+              example:
+                data:
+                  - call_id: call_01K4ZAZBR1KQEM19YEJGJ3RF5P
+                    connection_id: conn_01K4ZAZBR1KQEM19YEJGJ3RF5P
+                    session_id: sess_01K4ZAZBR1KQEM19YEJGJ3RF5P
+                    tool: add_issue_comment
+                    status: succeeded
+                    arguments_fingerprint: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+                    fingerprint_key_id: key-2026-09
+                    duration_ms: 800
+                    created_at: '2026-09-10T20:20:00Z'
+                    updated_at: '2026-09-10T20:20:00.800Z'
+                    completed_at: '2026-09-10T20:20:00.800Z'
+                next_cursor: null
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        default:
+          $ref: '#/components/responses/Error'
+  /v1/calls/{call_id}:
+    parameters:
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/UserId'
+      - $ref: '#/components/parameters/CallId'
+    get:
+      operationId: getCall
+      x-ravn-phase: core
+      tags: [Calls]
+      summary: Inspect an authorized call's sanitized status.
+      description: |
+        A call record is scoped to its original app/tenant/user and current
+        owner/ACL visibility. Knowing call_id is not access. Sanitized metadata
+        remains inspectable after session expiry/revocation or connection
+        disconnect for the retention period. Raw results are not persisted by
+        default, so result_available normally remains false here. If an operator
+        enables bounded encrypted result retention, result may be present only
+        while available AND currently authorized for execution on the connection.
+        Arguments, original idempotency keys, credential material, raw upstream
+        error bodies, and secret references are omitted.
+
+        unknown is a terminal RAVN observation, not proof of upstream failure.
+        It requires reconciliation and must not cause automatic re-execution.
+      responses:
+        '200':
+          description: Current call status and optional explicitly retained result.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CallRecord'
+              example:
+                call_id: call_01K4ZAZBR1KQEM19YEJGJ3RF5P
+                connection_id: conn_01K4ZAZBR1KQEM19YEJGJ3RF5P
+                session_id: null
+                tool: list_issues
+                status: succeeded
+                arguments_fingerprint: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+                fingerprint_key_id: key-2026-09
+                duration_ms: 1000
+                result_available: false
+                created_at: '2026-09-11T20:20:00Z'
+                updated_at: '2026-09-11T20:20:01Z'
+                completed_at: '2026-09-11T20:20:01Z'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        default:
+          $ref: '#/components/responses/Error'
+  /v1/sessions:
+    parameters:
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/UserId'
+    post:
+      operationId: createRuntimeSession
+      x-ravn-phase: core
+      tags: [Runtime sessions]
+      summary: Mint MCP access for one authorized connection and actor.
+      description: |
+        Core management for the MCP path. The trusted backend mints the token;
+        the agent's existing MCP client uses it as a Bearer credential at mcp_url.
+        The backend explicitly selects one authorized connection, not every
+        connection belonging to the user. Account setup is reused across runs.
+        Use a lifetime appropriate for the run; a fixed-token client needs only
+        configurable authentication headers. Longer runs need a tested backend-
+        managed replacement/reconnection path, not a fresh provider login.
+        Reviewed writes do not require a per-call idempotency key. Session
+        replacement never authorizes replay of a possibly executed write.
+        Backend-mediated REST calls instead use application authentication directly
+        and do not require this session endpoint.
+
+        The token binds app, tenant, user, one connection, current connection
+        epoch, expiry, and a snapshot of the supported access ceiling. Additional
+        caller-supplied tool/resource restrictions are an optional extension; a
+        build without it rejects non-null restrictions with unsupported_constraint.
+        It does not represent
+        a new provider OAuth grant, grant service ownership, or create a global
+        agent identity. Restrictions can only narrow current permitted access.
+        Operator/connection restrictions still apply and current lifecycle state
+        is checked at admission. The lifetime defaults to 3600 seconds (one hour)
+        and permits 60-14400 seconds within operator settings. Requests above
+        the configured maximum are rejected, not silently shortened. Omission
+        uses the configured default; expires_at is authoritative. Expiry blocks
+        new admission, not an already-admitted operation; early revocation is
+        available and does not undo upstream actions.
+
+        Only the token hash/verifier is stored. Plaintext token is returned once,
+        never in list responses or logs. Runtime tokens are rejected by /v1
+        routes and must not carry actor overrides on /mcp. Application credentials
+        must not be installed in untrusted agent execution environments.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateRuntimeSessionRequest'
+            examples:
+              inheritConnectionAccess:
+                value:
+                  connection_id: conn_01K4ZAZBR1KQEM19YEJGJ3RF5P
+              narrowForReadTask:
+                value:
+                  connection_id: conn_01K4ZAZBR1KQEM19YEJGJ3RF5P
+                  ttl_seconds: 3600
+                  restrictions:
+                    tools: [list_issues, issue_read]
+                    resources:
+                      repositories: [acme/backend]
+      responses:
+        '201':
+          description: Session created; plaintext token is disclosed once.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreatedRuntimeSession'
+              example:
+                id: sess_01K4ZAZBR1KQEM19YEJGJ3RF5P
+                token: ravn_session_EXAMPLE_NOT_A_REAL_TOKEN
+                mcp_url: https://ravn.example.com/mcp
+                expires_at: '2026-09-11T21:20:00Z'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        default:
+          $ref: '#/components/responses/Error'
+    get:
+      operationId: listRuntimeSessions
+      x-ravn-phase: core
+      tags: [Runtime sessions]
+      summary: List authorized runtime sessions without tokens.
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - name: connection_id
+          in: query
+          schema:
+            $ref: '#/components/schemas/ResourceId'
+      responses:
+        '200':
+          description: Bounded session metadata page.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RuntimeSessionPage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        default:
+          $ref: '#/components/responses/Error'
+  /v1/sessions/{session_id}/revoke:
+    parameters:
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/UserId'
+      - $ref: '#/components/parameters/SessionId'
+    post:
+      operationId: revokeRuntimeSession
+      x-ravn-phase: core
+      tags: [Runtime sessions]
+      summary: Revoke a runtime credential without disconnecting its provider account.
+      description: |
+        Locally idempotent. After the state commit, new dispatches authenticated
+        with this token fail even before its original expiry. This does not
+        revoke the application's credential, the provider credential, other
+        sessions, or already-dispatched upstream work.
+      responses:
+        '204':
+          description: Revoked, or already revoked/expired.
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        default:
+          $ref: '#/components/responses/Error'
+  /v1/events:
+    parameters:
+      - $ref: '#/components/parameters/TenantId'
+      - $ref: '#/components/parameters/UserId'
+    get:
+      operationId: listEvents
+      x-ravn-phase: optional-extension
+      tags: [Events]
+      summary: '[Optional extension] List sanitized activity visible to the current actor.'
+      description: |
+        Events contain identifiers, decisions, timestamps, latency, and safe
+        diagnostic codes, not tool arguments/results, tokens, headers, OAuth
+        codes, provider raw errors, or secret paths. Default API visibility is
+        scoped to the requesting app/tenant/user; tenant membership is not an
+        administrator role. Filters and pagination cursors do not widen access.
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - name: connection_id
+          in: query
+          schema:
+            $ref: '#/components/schemas/ResourceId'
+        - name: session_id
+          in: query
+          schema:
+            $ref: '#/components/schemas/ResourceId'
+        - name: call_id
+          in: query
+          schema:
+            $ref: '#/components/schemas/ResourceId'
+        - name: event_type
+          in: query
+          schema:
+            $ref: '#/components/schemas/EventType'
+        - name: outcome
+          in: query
+          schema:
+            $ref: '#/components/schemas/EventOutcome'
+        - name: from
+          in: query
+          description: Inclusive lower UTC time bound.
+          schema:
+            type: string
+            format: date-time
+        - name: to
+          in: query
+          description: Exclusive upper UTC time bound; must be after from when both are supplied.
+          schema:
+            type: string
+            format: date-time
+      responses:
+        '200':
+          description: Bounded sanitized activity page, newest first.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EventPage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        default:
+          $ref: '#/components/responses/Error'
+components:
+  securitySchemes:
+    ApplicationCredential:
+      type: http
+      scheme: bearer
+      bearerFormat: Opaque RAVN application credential
+      description: |
+        A secret provisioned for one configured application. RAVN derives app_id
+        from it. Keep it in the trusted backend and never in browser bundles,
+        mobile applications, model prompts, or an agent sandbox. It is distinct
+        from provider OAuth credentials and from connection-bound runtime tokens.
+        It can assert any user in its application's namespace; it does not grant
+        RAVN deployment administration or identity for a particular agent.
+  parameters:
+    TenantId:
+      name: X-Ravn-Tenant-Id
+      in: header
+      required: false
+      description: |
+        CONDITIONALLY REQUIRED by operator-configured tenant_mode, not by caller
+        choice. In multi mode, omission or an empty value returns invalid_request.
+        In single mode, omission resolves to the literal default; an explicit
+        default is accepted and any other value returns invalid_request.
+        OpenAPI cannot express a header requirement conditional on server-side
+        application configuration. Every resource is still scoped by the resolved
+        tenant. Derive this identifier from verified application context, never
+        model output. Do not concatenate tenant and user IDs to emulate isolation.
+      schema:
+        $ref: '#/components/schemas/ActorIdentifier'
+      example: tenant_acme
+    UserId:
+      name: X-Ravn-User-Id
+      in: header
+      required: true
+      description: |
+        Opaque user identifier from the application's verified login/session,
+        scoped to the application and tenant. This is an identity assertion by
+        the trusted backend, not a user-supplied permission grant. Service-owned
+        connection execution additionally requires its explicit configured ACL.
+      schema:
+        $ref: '#/components/schemas/ActorIdentifier'
+      example: user_alice
+    ConnectSessionId:
+      name: connect_session_id
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/ResourceId'
+    ConnectionId:
+      name: connection_id
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/ResourceId'
+    SessionId:
+      name: session_id
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/ResourceId'
+    CallId:
+      name: call_id
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/ResourceId'
+    Cursor:
+      name: cursor
+      in: query
+      description: |
+        Opaque continuation cursor. Bound to actor, endpoint, filters, and
+        relevant authorization context. Do not parse or construct it. Invalid,
+        expired, or mismatched cursors return invalid_cursor.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 2048
+    Limit:
+      name: limit
+      in: query
+      description: Requested maximum number of items; the service can return fewer.
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 50
+    IfMatch:
+      name: If-Match
+      in: header
+      required: true
+      description: |
+        Strong ETag containing the current connection revision as a quoted
+        positive integer. Wildcards, multiple ETags, and weak ETags are not
+        supported. Example header value is "3".
+      schema:
+        type: string
+        pattern: '^"[1-9][0-9]*"$'
+      example: '"3"'
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: |
+        Optional for every MVP tool, including reviewed writes. Use a random
+        identifier for one logical action and reuse it for retries of that exact
+        request. A new action needs a new key; do not derive keys from personal
+        data or credentials. Keyless resubmissions can execute again. A supplied
+        but malformed key is rejected. Local deduplication lasts only while the
+        record is retained (30 days by default) and is not upstream exactly-once
+        execution. A key never authorizes automatic retry of an ambiguous write.
+        MCP uses its separate optional params._meta["ravn/idempotency-key"] field.
+      schema:
+        type: string
+        minLength: 8
+        maxLength: 128
+        pattern: '^[A-Za-z0-9._:-]+$'
+      example: 798353aa-1ed9-4c7c-a6d1-c655a3e91b37
+  headers:
+    NoStore:
+      description: Sensitive response is not cacheable.
+      schema:
+        type: string
+        const: no-store
+    ConnectionETag:
+      description: Quoted connection revision used by a subsequent If-Match edit.
+      schema:
+        type: string
+        pattern: '^"[1-9][0-9]*"$'
+      example: '"3"'
+    RetryAfter:
+      description: Suggested seconds before polling/retrying an explicitly safe operation.
+      schema:
+        type: integer
+        minimum: 1
+      example: 2
+    IdempotencyReplayed:
+      description: True if this response concerns an existing idempotent call instead of a new dispatch.
+      schema:
+        type: boolean
+  responses:
+    Error:
+      description: |
+        Sanitized error. Clients branch on stable error.code, not message text.
+        retryable is advisory and never overrides outcome_unknown or unsafe
+        upstream-write semantics. Unknown codes must be handled conservatively.
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    BadRequest:
+      description: |
+        Malformed request, missing actor headers, invalid cursor, invalid return
+        URL, malformed optional idempotency key, out-of-policy session TTL,
+        invalid activity time range, or invalid completion code. No
+        upstream tool call is dispatched for request-validation failure.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    Unauthenticated:
+      description: Missing, malformed, revoked, or incorrect application credential; runtime tokens are not accepted here.
+      headers:
+        WWW-Authenticate:
+          description: Bearer authentication challenge without sensitive details.
+          schema:
+            type: string
+          example: Bearer realm="ravn"
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          example:
+            error:
+              code: unauthenticated
+              message: Valid application authentication is required.
+              request_id: req_01K4ZAZBR1KQEM19YEJGJ3RF5P
+              retryable: false
+    Forbidden:
+      description: |
+        The object is accessible but the current actor lacks the requested
+        permission, or a known restriction denies the requested operation.
+        Inaccessible foreign objects return 404 instead.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          example:
+            error:
+              code: permission_denied
+              message: This action is not permitted for the connection.
+              request_id: req_01K4ZAZBR1KQEM19YEJGJ3RF5P
+              retryable: false
+    NotFound:
+      description: Resource does not exist or is not accessible in the requesting app/tenant/user context.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          example:
+            error:
+              code: not_found
+              message: Resource not found.
+              request_id: req_01K4ZAZBR1KQEM19YEJGJ3RF5P
+              retryable: false
+    Conflict:
+      description: |
+        Lifecycle or request conflict. Examples include connection_disabled,
+        connection_reauth_required, connect_session_expired,
+        connect_session_not_pending, provider_account_mismatch, and
+        idempotency_conflict. Inspect the stable code before taking action.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    Unprocessable:
+      description: |
+        Syntactically valid input cannot be safely supported, such as an
+        unsupported resource constraint, invalid tool arguments, or a credential
+        that failed provider identity verification. Unsupported restrictions are
+        not silently ignored.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    RateLimited:
+      description: Rate or concurrency limit reached before a new upstream dispatch.
+      headers:
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    BadGateway:
+      description: Registered upstream failed; raw provider/auth errors are redacted. Inspect code and retryable.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+  schemas:
+    ActorIdentifier:
+      type: string
+      minLength: 1
+      maxLength: 128
+      pattern: '^[A-Za-z0-9][A-Za-z0-9_.:@/-]{0,127}$'
+      description: Stable opaque application identity; avoid email addresses and mutable display names.
+    IntegrationId:
+      type: string
+      minLength: 1
+      maxLength: 64
+      pattern: '^[a-z0-9][a-z0-9_-]*$'
+      examples: [github]
+    ResourceId:
+      type: string
+      minLength: 8
+      maxLength: 128
+      pattern: '^[A-Za-z0-9][A-Za-z0-9_-]*$'
+      description: Opaque server-generated identifier. Possession is not authorization.
+    HealthStatus:
+      type: object
+      additionalProperties: false
+      required: [status]
+      properties:
+        status:
+          type: string
+          const: ok
+    ReadinessFailure:
+      type: object
+      additionalProperties: false
+      required: [status]
+      properties:
+        status:
+          type: string
+          const: not_ready
+    StartConnectSessionRequest:
+      type: object
+      additionalProperties: false
+      required: [integration_id, return_url, app_state]
+      properties:
+        integration_id:
+          $ref: '#/components/schemas/IntegrationId'
+        return_url:
+          type: string
+          format: uri
+          maxLength: 2048
+          description: Exact application return URL from the operator allowlist; HTTPS outside loopback development.
+        app_state:
+          type: string
+          minLength: 16
+          maxLength: 128
+          description: |
+            High-entropy opaque application transaction identifier bound to the
+            original browser/login transaction. Returned to the application but
+            not an OAuth authorization grant or end-user authentication proof.
+        reconnect_connection_id:
+          $ref: '#/components/schemas/ResourceId'
+    CreatedConnectSession:
+      type: object
+      additionalProperties: false
+      required: [id, status, authorization_url, expires_at]
+      properties:
+        id:
+          $ref: '#/components/schemas/ResourceId'
+        status:
+          type: string
+          const: pending
+        authorization_url:
+          type: string
+          format: uri
+          description: Browser authorization entry point; sensitive short-lived URL, not the MCP endpoint.
+        expires_at:
+          type: string
+          format: date-time
+          description: Original 10-minute transaction deadline; staging never extends this lifetime.
+    ConnectSessionStatus:
+      type: string
+      enum: [pending, awaiting_completion, completed, denied, cancelled, expired, failed]
+    ConnectSession:
+      type: object
+      additionalProperties: false
+      required: [id, integration_id, status, expires_at, completion_expires_at, connection_id, created_at, updated_at]
+      properties:
+        id:
+          $ref: '#/components/schemas/ResourceId'
+        integration_id:
+          $ref: '#/components/schemas/IntegrationId'
+        status:
+          $ref: '#/components/schemas/ConnectSessionStatus'
+        expires_at:
+          type: string
+          format: date-time
+          description: Original 10-minute transaction deadline; it remains a hard upper bound during completion staging.
+        completion_expires_at:
+          type: [string, 'null']
+          format: date-time
+          description: Staged-credential deadline, min(validated callback time plus 5 minutes, original expires_at); null before staging.
+        connection_id:
+          type: [string, 'null']
+          description: Present only after committed completion; null otherwise.
+        failure_code:
+          type: string
+          maxLength: 64
+          description: Optional safe lifecycle code, never raw provider errors or credentials.
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    CompleteConnectSessionRequest:
+      type: object
+      additionalProperties: false
+      required: [completion_code]
+      properties:
+        completion_code:
+          type: string
+          minLength: 32
+          maxLength: 512
+          writeOnly: true
+          description: Single-use code from the original browser return, validated after application transaction matching.
+    ImportConnectionRequest:
+      type: object
+      additionalProperties: false
+      required: [integration_id, credential]
+      properties:
+        integration_id:
+          $ref: '#/components/schemas/IntegrationId'
+        credential:
+          $ref: '#/components/schemas/PersonalBearerCredential'
+        label:
+          type: string
+          minLength: 1
+          maxLength: 128
+    PersonalBearerCredential:
+      type: object
+      additionalProperties: false
+      required: [type, token]
+      writeOnly: true
+      properties:
+        type:
+          type: string
+          const: bearer
+        token:
+          type: string
+          minLength: 1
+          maxLength: 16384
+          writeOnly: true
+          description: Personal provider bearer token; never returned, logged, or sent to an arbitrary caller-selected destination.
+    ConnectionStatus:
+      type: string
+      enum: [active, reconnect_required, disabled, disconnected]
+      description: |
+        active is usable subject to access checks. reconnect_required means the
+        credential is unusable and needs user reauthorization/replacement;
+        execution errors use the stable code connection_reauth_required.
+        disabled means the operator disabled the integration or connection.
+        disconnected means an explicit local disconnect was committed. None of
+        these states promise cancellation of already-dispatched upstream work.
+    Connection:
+      type: object
+      additionalProperties: false
+      required: [id, integration_id, owner_kind, status, provider_account_id, display_name, label, epoch, revision, restrictions, created_at, updated_at]
+      properties:
+        id:
+          $ref: '#/components/schemas/ResourceId'
+        integration_id:
+          $ref: '#/components/schemas/IntegrationId'
+        owner_kind:
+          type: string
+          enum: [user, service]
+          description: User ownership or an explicitly operator-configured service binding; not an implicit tenant-wide grant.
+        status:
+          $ref: '#/components/schemas/ConnectionStatus'
+        provider_account_id:
+          type: string
+          minLength: 1
+          maxLength: 512
+          description: Verified stable provider account/workspace subject, not a caller-supplied display label.
+        display_name:
+          type: string
+          maxLength: 256
+          description: Sanitized provider display label; untrusted display data and not an authorization identifier.
+        label:
+          type: [string, 'null']
+          maxLength: 128
+          description: Optional application/user-assigned label; null means no custom label.
+        epoch:
+          type: integer
+          minimum: 1
+          description: Security generation checked by runtime sessions; changes invalidate tokens from earlier generations.
+        revision:
+          type: integer
+          minimum: 1
+          description: Metadata/configuration revision; returned as a quoted strong ETag for optimistic updates.
+        credential_type:
+          type: string
+          enum: [bearer, oauth2]
+          description: Imported token or managed OAuth bundle; never the credential value.
+        credential_version:
+          type: integer
+          minimum: 1
+          description: Increments on credential replacement/refresh independently of authority epoch.
+        restrictions:
+          $ref: '#/components/schemas/NullableRestrictions'
+        oauth_granted_scopes:
+          type: [array, 'null']
+          items:
+            type: string
+          description: |
+            Provider-reported OAuth scope strings when available. Null means
+            unavailable/not OAuth, not no provider permissions. These are not
+            RAVN tool names and do not fully describe provider resource access.
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    UpdateConnectionRequest:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        label:
+          type: [string, 'null']
+          minLength: 1
+          maxLength: 128
+          description: Replace the custom label; null clears it. Omission leaves it unchanged.
+        restrictions:
+          $ref: '#/components/schemas/NullableRestrictions'
+    NullableRestrictions:
+      description: |
+        Optional additional RAVN restrictions, never an expansion of provider,
+        operator, or connection authority. Null or {} means no additional
+        restrictions at this layer. Normalize empty nested resources away;
+        {resources:{}} therefore also normalizes to null. Empty arrays are not
+        empty objects and retain explicit deny semantics.
+      oneOf:
+        - $ref: '#/components/schemas/Restrictions'
+        - type: 'null'
+    Restrictions:
+      type: object
+      additionalProperties: false
+      properties:
+        tools:
+          type: array
+          maxItems: 512
+          uniqueItems: true
+          items:
+            type: string
+            minLength: 1
+            maxLength: 256
+          description: |
+            Exact connector-visible tool-name allowlist, without glob patterns.
+            Omission adds no tool restriction at this layer. [] denies all
+            tools. Names must be validated against the registered integration.
+        resources:
+          type: object
+          additionalProperties: false
+          properties:
+            repositories:
+              type: array
+              maxItems: 512
+              uniqueItems: true
+              items:
+                type: string
+                minLength: 3
+                maxLength: 256
+                pattern: '^[^/\s]+/[^/\s]+$'
+              description: |
+                Exact canonical owner/repository identifiers for a connector
+                that supports repository enforcement. No glob patterns.
+                Canonicalization and resource identity verification are
+                connector responsibilities; a repository name string alone is
+                not proof against rename/transfer or tool argument aliases.
+                [] denies repository-scoped calls. With this constraint set,
+                calls that the connector cannot safely resource-constrain are
+                rejected, not implicitly allowed.
+    DisconnectResponse:
+      type: object
+      additionalProperties: false
+      required: [connection, provider_revocation]
+      properties:
+        connection:
+          $ref: '#/components/schemas/Connection'
+          properties:
+            status:
+              const: disconnected
+        provider_revocation:
+          type: string
+          enum: [succeeded, pending, unsupported, failed]
+          description: |
+            Status of provider-side revocation, separate from successful local
+            disconnect. succeeded means this provider revocation attempt
+            succeeded, not that all credentials for that account everywhere
+            were revoked. unsupported/failed must not undo the local block.
+    ConnectionPage:
+      type: object
+      additionalProperties: false
+      required: [data, next_cursor]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Connection'
+        next_cursor:
+          $ref: '#/components/schemas/NextCursor'
+    NextCursor:
+      type: [string, 'null']
+      maxLength: 2048
+      description: Opaque continuation cursor, or null when there is no next page.
+    Tool:
+      type: object
+      additionalProperties: false
+      required: [name, description, input_schema, effect, supported_resource_constraints]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 256
+          description: Exact callable name within this connection's integration; discover rather than invent it.
+        description:
+          type: string
+          description: Untrusted tool description, not policy or an instruction to grant permissions.
+        input_schema:
+          $ref: '#/components/schemas/JsonSchema'
+        output_schema:
+          $ref: '#/components/schemas/JsonSchema'
+        effect:
+          type: string
+          enum: [read, mutate, unknown]
+          description: |
+            RAVN connector/operator-verified classification used for retry safety,
+            not mandatory keys. Unknown is the safe fallback. Upstream MCP annotations
+            alone do not establish a read-only classification.
+        supported_resource_constraints:
+          type: array
+          uniqueItems: true
+          items:
+            type: string
+            enum: [repositories]
+          description: Constraints for which this connector/tool has an explicit safe evaluator.
+        annotations:
+          type: object
+          additionalProperties: true
+          description: Optional sanitized upstream display hints; never authoritative for authorization or retries.
+    JsonSchema:
+      type: object
+      additionalProperties: true
+      description: |
+        JSON Schema supplied by a registered connector/upstream MCP server.
+        Treat as data; enforce configured nesting/size limits and never fetch
+        arbitrary remote references during validation.
+    ToolPage:
+      type: object
+      additionalProperties: false
+      required: [data, next_cursor]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Tool'
+        next_cursor:
+          $ref: '#/components/schemas/NextCursor'
+    ToolCallRequest:
+      type: object
+      additionalProperties: false
+      required: [tool, arguments]
+      properties:
+        tool:
+          type: string
+          minLength: 1
+          maxLength: 256
+        arguments:
+          type: object
+          additionalProperties: true
+          description: |
+            Tool-specific arguments, validated against the known schema and
+            any connector-aware resource policy. An empty object is valid for
+            parameterless tools. Arguments are not persisted in default logs.
+    ToolResult:
+      type: object
+      additionalProperties: false
+      required: [content, is_error]
+      properties:
+        content:
+          type: array
+          items:
+            $ref: '#/components/schemas/McpContentBlock'
+          description: |
+            MCP-like returned content. The broker applies protocol/size checks
+            and does not automatically follow returned resource or image URLs.
+            Result data is untrusted and can contain sensitive provider data.
+        structured_content:
+          type: object
+          additionalProperties: true
+          description: Optional structured tool output; REST uses snake_case, not an invented upstream MCP field.
+        is_error:
+          type: boolean
+          description: Tool-level error indicator, separate from HTTP/broker errors.
+    McpContentBlock:
+      type: object
+      required: [type]
+      additionalProperties: true
+      description: |
+        An MCP content block such as text, image, audio, resource, or resource_link.
+        MCP field spelling is preserved inside each block, including mimeType
+        where applicable. This extensible REST envelope does not replace strict
+        negotiated-version validation in the actual MCP transport implementation.
+        Returned links are data, not broker instructions to fetch arbitrary URLs.
+      properties:
+        type:
+          type: string
+          minLength: 1
+        text:
+          type: string
+        data:
+          type: string
+          description: Base64 data for supported media blocks; enforce configured result-size limits.
+        mimeType:
+          type: string
+        uri:
+          type: string
+        resource:
+          type: object
+          additionalProperties: true
+    CompletedCallResponse:
+      type: object
+      additionalProperties: false
+      required: [call_id, status, result_available]
+      properties:
+        call_id:
+          $ref: '#/components/schemas/ResourceId'
+        status:
+          type: string
+          enum: [succeeded, tool_error]
+        result_available:
+          type: boolean
+          description: True for a live retained response; false for a replay whose raw result was not persisted.
+        result:
+          $ref: '#/components/schemas/ToolResult'
+      allOf:
+        - if:
+            properties:
+              result_available:
+                const: true
+          then:
+            required: [result]
+          else:
+            not:
+              required: [result]
+        - if:
+            properties:
+              status:
+                const: succeeded
+          then:
+            properties:
+              result:
+                properties:
+                  is_error:
+                    const: false
+          else:
+            properties:
+              result:
+                properties:
+                  is_error:
+                    const: true
+    InProgressCallResponse:
+      type: object
+      additionalProperties: false
+      required: [call_id, status, result_available]
+      properties:
+        call_id:
+          $ref: '#/components/schemas/ResourceId'
+        status:
+          type: string
+          const: running
+        result_available:
+          type: boolean
+          const: false
+    CallStatus:
+      type: string
+      enum: [running, succeeded, tool_error, denied, failed, unknown]
+      description: |
+        unknown means the operation may have executed but RAVN cannot prove the
+        outcome; it is not equivalent to failed. failed is reserved for known
+        local/pre-dispatch or otherwise proven non-execution failure.
+    CallSummary:
+      type: object
+      additionalProperties: false
+      description: Metadata only; raw arguments, result bodies, credentials, and original idempotency keys are never included.
+      required: [call_id, connection_id, session_id, tool, status, arguments_fingerprint, fingerprint_key_id, duration_ms, created_at, updated_at, completed_at]
+      properties:
+        call_id:
+          $ref: '#/components/schemas/ResourceId'
+        connection_id:
+          $ref: '#/components/schemas/ResourceId'
+        session_id:
+          description: Originating runtime session ID, or null for a REST execution; provenance is not authority.
+          anyOf:
+            - $ref: '#/components/schemas/ResourceId'
+            - type: 'null'
+        tool:
+          type: string
+          maxLength: 256
+        status:
+          $ref: '#/components/schemas/CallStatus'
+        arguments_fingerprint:
+          type: [string, 'null']
+          pattern: '^[a-f0-9]{64}$'
+          description: |
+            Diagnostic domain-separated HMAC-SHA-256 of canonical validated
+            arguments and actor/connection/tool context, not a plain hash or
+            a deduplication key. Null if not available before input validation.
+            Compares equality within a context/key version, not argument contents.
+        fingerprint_key_id:
+          type: [string, 'null']
+          maxLength: 128
+          description: HMAC key version, null when no argument fingerprint exists. Rotation can change fingerprints.
+        duration_ms:
+          type: [integer, 'null']
+          minimum: 0
+          description: Broker-observed call duration including preparation/upstream time; null while running or when unmeasurable.
+        error_code:
+          type: string
+          maxLength: 64
+          description: Optional stable sanitized failure code, never an upstream body.
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        completed_at:
+          type: [string, 'null']
+          format: date-time
+          description: Terminal local observation time; null while running.
+    CallPage:
+      type: object
+      additionalProperties: false
+      required: [data, next_cursor]
+      properties:
+        data:
+          type: array
+          maxItems: 100
+          items:
+            $ref: '#/components/schemas/CallSummary'
+        next_cursor:
+          $ref: '#/components/schemas/NextCursor'
+    CallRecord:
+      type: object
+      additionalProperties: false
+      required: [call_id, connection_id, session_id, tool, status, arguments_fingerprint, fingerprint_key_id, duration_ms, created_at, updated_at, completed_at, result_available]
+      properties:
+        call_id:
+          $ref: '#/components/schemas/ResourceId'
+        connection_id:
+          $ref: '#/components/schemas/ResourceId'
+        session_id:
+          description: Originating runtime session ID, or null for a REST execution; provenance is not authority.
+          anyOf:
+            - $ref: '#/components/schemas/ResourceId'
+            - type: 'null'
+        tool:
+          type: string
+          maxLength: 256
+        status:
+          $ref: '#/components/schemas/CallStatus'
+        arguments_fingerprint:
+          type: [string, 'null']
+          pattern: '^[a-f0-9]{64}$'
+          description: |
+            Diagnostic domain-separated HMAC-SHA-256 of canonical validated
+            arguments and actor/connection/tool context, not a plain hash or
+            a deduplication key. Null if not available before input validation.
+            Compares equality within a context/key version, not argument contents.
+        fingerprint_key_id:
+          type: [string, 'null']
+          maxLength: 128
+          description: HMAC key version, null when no argument fingerprint exists. Rotation can change fingerprints.
+        duration_ms:
+          type: [integer, 'null']
+          minimum: 0
+          description: Broker-observed call duration including preparation/upstream time; null while running or when unmeasurable.
+        error_code:
+          type: string
+          maxLength: 64
+          description: Optional stable sanitized failure code, never an upstream body.
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        completed_at:
+          type: [string, 'null']
+          format: date-time
+          description: Terminal local observation time; null while running.
+        result_available:
+          type: boolean
+          description: False unless explicit retention is enabled, content is still retained, and current execution authorization permits retrieval.
+        result:
+          $ref: '#/components/schemas/ToolResult'
+      allOf:
+        - if:
+            properties:
+              result_available:
+                const: true
+          then:
+            required: [result]
+          else:
+            not:
+              required: [result]
+    CreateRuntimeSessionRequest:
+      type: object
+      additionalProperties: false
+      required: [connection_id]
+      properties:
+        connection_id:
+          $ref: '#/components/schemas/ResourceId'
+        ttl_seconds:
+          type: integer
+          minimum: 60
+          maximum: 14400
+          default: 3600
+          description: |
+            Requested fixed lifetime. Omission uses sessions.default_ttl_seconds
+            (3600 by default). The configured maximum is at most 14400 seconds;
+            operators validate 60 <= default <= maximum <= 14400. Reject a value
+            above the configured maximum with 400 invalid_request, never silently
+            shorten it. No token refresh/renewal grant or client hot-swap hook is
+            implied. The returned expires_at is authoritative.
+        restrictions:
+          $ref: '#/components/schemas/NullableRestrictions'
+    CreatedRuntimeSession:
+      type: object
+      additionalProperties: false
+      required: [id, token, mcp_url, expires_at]
+      properties:
+        id:
+          $ref: '#/components/schemas/ResourceId'
+        token:
+          type: string
+          minLength: 32
+          readOnly: true
+          description: Sensitive opaque runtime bearer, disclosed once. Never persist in logs or browser bundles by default.
+        mcp_url:
+          type: string
+          format: uri
+          description: RAVN MCP endpoint for this runtime token; not the upstream provider URL or OAuth connection URL.
+        expires_at:
+          type: string
+          format: date-time
+    RuntimeSession:
+      type: object
+      additionalProperties: false
+      required: [id, connection_id, status, connection_epoch, restrictions, created_at, expires_at, revoked_at]
+      properties:
+        id:
+          $ref: '#/components/schemas/ResourceId'
+        connection_id:
+          $ref: '#/components/schemas/ResourceId'
+        status:
+          type: string
+          enum: [active, expired, revoked, invalidated]
+          description: Invalidated includes connection epoch changes or an inactive connection.
+        connection_epoch:
+          type: integer
+          minimum: 1
+        restrictions:
+          $ref: '#/components/schemas/NullableRestrictions'
+        created_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+        revoked_at:
+          type: [string, 'null']
+          format: date-time
+    RuntimeSessionPage:
+      type: object
+      additionalProperties: false
+      required: [data, next_cursor]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/RuntimeSession'
+        next_cursor:
+          $ref: '#/components/schemas/NextCursor'
+    EventType:
+      type: string
+      enum:
+        - connect.started
+        - connect.staged
+        - connect.completed
+        - connect.cancelled
+        - connect.failed
+        - connection.imported
+        - connection.updated
+        - connection.disconnected
+        - credential.refreshed
+        - credential.reauth_required
+        - session.created
+        - session.revoked
+        - tool.called
+        - tool.denied
+    EventOutcome:
+      type: string
+      enum: [succeeded, denied, failed, unknown]
+    Event:
+      type: object
+      additionalProperties: false
+      required: [id, event_type, outcome, request_id, occurred_at]
+      properties:
+        id:
+          $ref: '#/components/schemas/ResourceId'
+        event_type:
+          $ref: '#/components/schemas/EventType'
+        outcome:
+          $ref: '#/components/schemas/EventOutcome'
+        request_id:
+          type: string
+          maxLength: 128
+        connection_id:
+          $ref: '#/components/schemas/ResourceId'
+        session_id:
+          $ref: '#/components/schemas/ResourceId'
+        call_id:
+          $ref: '#/components/schemas/ResourceId'
+        tool:
+          type: string
+          maxLength: 256
+        code:
+          type: string
+          maxLength: 64
+          description: Safe decision/failure code, not provider raw text.
+        duration_ms:
+          type: integer
+          minimum: 0
+        occurred_at:
+          type: string
+          format: date-time
+    EventPage:
+      type: object
+      additionalProperties: false
+      required: [data, next_cursor]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Event'
+        next_cursor:
+          $ref: '#/components/schemas/NextCursor'
+    ErrorEnvelope:
+      type: object
+      additionalProperties: false
+      required: [error]
+      properties:
+        error:
+          $ref: '#/components/schemas/ApiError'
+    ApiError:
+      type: object
+      additionalProperties: false
+      required: [code, message, request_id, retryable]
+      properties:
+        code:
+          type: string
+          minLength: 1
+          maxLength: 64
+          description: |
+            Stable machine-readable code. Initial vocabulary includes
+            unauthenticated, invalid_request, missing_actor_context,
+            invalid_cursor, invalid_return_url, completion_code_invalid,
+            connect_session_expired, connect_session_not_pending,
+            provider_account_mismatch, credential_invalid, not_found,
+            permission_denied, connection_disabled, connection_reauth_required,
+            revision_conflict, precondition_required, unsupported_constraint,
+            invalid_arguments, idempotency_conflict,
+            rate_limited, upstream_unavailable, outcome_unknown, and
+            internal_error. Unknown future codes must not cause unsafe retries.
+        message:
+          type: string
+          maxLength: 512
+          description: Safe human explanation, not a stable contract or raw upstream response.
+        request_id:
+          type: string
+          minLength: 1
+          maxLength: 128
+          description: Correlation identifier suitable for safe support/audit lookup.
+        retryable:
+          type: boolean
+          description: |
+            Advisory only for a known-safe read or proven pre-dispatch failure.
+            Never true for outcome_unknown. RAVN helpers do not automatically
+            retry tool-call writes; SDKs must not infer safety from HTTP 5xx or
+            key presence. If a caller explicitly retries one keyed action, it
+            must reuse the original key.
+        details:
+          type: object
+          additionalProperties: false
+          description: Optional sanitized structured context; no arbitrary provider data.
+          properties:
+            call_id:
+              $ref: '#/components/schemas/ResourceId'
+            status:
+              $ref: '#/components/schemas/CallStatus'
+            field:
+              type: string
+              maxLength: 128
+              description: Invalid field name/path without its submitted value.
+            constraint:
+              type: string
+              maxLength: 64
+            retry_after_seconds:
+              type: integer
+              minimum: 1
+      allOf:
+        - if:
+            properties:
+              code:
+                const: outcome_unknown
+          then:
+            properties:
+              retryable:
+                const: false
+              details:
+                required: [call_id, status]
+                properties:
+                  status:
+                    const: unknown
+            required: [details]

@@ -1,0 +1,27 @@
+{
+  "source": "Ravn Console.html (user supplied)",
+  "sha256": "ca2cfec965653dac2313e460f2493a4b07eefe6e87f16f1b5369659948edb2eb",
+  "components": [
+    "components/core/Icon.jsx",
+    "components/core/Button.jsx",
+    "components/core/Input.jsx",
+    "components/core/SearchField.jsx",
+    "components/core/Select.jsx",
+    "components/core/Switch.jsx",
+    "components/data/AccessPath.jsx",
+    "components/data/DataTable.jsx",
+    "components/data/DataValue.jsx",
+    "components/data/StatusBadge.jsx",
+    "components/data/PermissionList.jsx",
+    "components/data/TimelineRow.jsx",
+    "components/graph/AgentGraph.jsx",
+    "components/graph/DelegationTimeline.jsx",
+    "components/shell/ConfirmModal.jsx",
+    "components/shell/Drawer.jsx",
+    "components/shell/EmptyState.jsx",
+    "components/shell/NavRail.jsx",
+    "components/shell/Toast.jsx",
+    "components/shell/TopBar.jsx"
+  ],
+  "note": "Extracted authored primitives and embedded assets; no HTML bootstrap, Babel, mock data or remote scripts."
+}

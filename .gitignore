@@ -1,0 +1,18 @@
+.venv/
+.pytest_cache/
+.ruff_cache/
+__pycache__/
+*.pyc
+.probe/
+.ravn/
+# Runtime state and one-use login links are never source files.
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.secret
+*.url
+*.log
+*.egg-info/
+dist/
+.env*

@@ -1,0 +1,56 @@
+name: RAVN broker
+
+on:
+  push:
+    paths:
+      - 'broker/**'
+      - '.github/workflows/broker.yml'
+  pull_request:
+    paths:
+      - 'broker/**'
+      - '.github/workflows/broker.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: broker-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: broker
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: broker/console/package-lock.json
+      - name: Install locked Python dependencies
+        run: |
+          python -m pip install uv==0.11.12
+          uv sync --locked
+      - name: Check Python style and tests
+        run: |
+          uv run --locked ruff format --check src tests examples
+          uv run --locked ruff check src tests examples
+          uv run --locked pytest
+      - name: Check and build the UI
+        working-directory: broker/console
+        run: |
+          npm ci --ignore-scripts
+          npm run format:check
+          npm test
+          npm run build
+      - name: Check packaged console assets are current
+        run: git diff --exit-code -- src/ravn/static/console
+      - name: Build Python package
+        run: uv build

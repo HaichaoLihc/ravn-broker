@@ -1,0 +1,61 @@
+[project]
+name = "ravn-broker"
+version = "0.1.0.dev0"
+description = "RAVN headless MCP connection broker"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "aiosqlite>=0.21,<1",
+    "cryptography>=46,<50",
+    "fastapi>=0.115,<1",
+    "httpx>=0.28,<1",
+    "httpx2>=2.12,<3",
+    "jsonschema>=4.23,<5",
+    "mcp>=2,<3",
+    "pydantic>=2.10,<3",
+    "pyyaml>=6,<7",
+    "uvicorn>=0.34,<1",
+]
+
+[project.scripts]
+ravn = "ravn.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8.3,<10", "anyio>=4.10,<5", "ruff>=0.11,<1"]
+
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ravn"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/ravn", "examples", "tests", "docs", "console", "README.md", "pyproject.toml", "uv.lock", ".gitignore"]
+exclude = [
+    "**/node_modules/**",
+    "**/__pycache__/**",
+    "**/*.pyc",
+    "**/.DS_Store",
+    "**/.env*",
+    "**/*.db",
+    "**/*.db-*",
+    "**/*.sqlite*",
+    "**/*.key",
+    "**/*.secret",
+    "**/*.url",
+    "**/*.log",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC"]
+ignore = ["E501"]  # The formatter wraps code; long SQL strings stay readable.
