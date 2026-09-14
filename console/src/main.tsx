@@ -44,6 +44,11 @@ const ICONS: Record<View, string> = {
   activity: 'activity',
   settings: 'settings',
 };
+const PROVIDERS: Record<string, string> = {
+  github_cloud: 'GitHub',
+  slack: 'Slack',
+  gmail: 'Gmail',
+};
 
 function State({ value }: { value: unknown }) {
   const label = String(value || 'unknown');
@@ -408,9 +413,16 @@ function Detail({
             <>
               <h2>Recorded outcome</h2>
               <State value={row.status} />
+              {row.effect === 'write' && row.status === 'unknown' && (
+                <p className="muted">
+                  This write may have run at the provider. RAVN never retries it; check the provider
+                  before trying again.
+                </p>
+              )}
               <Facts
                 items={[
                   ['Tool', row.tool],
+                  ['Effect', row.effect === 'write' ? 'Write (never retried)' : 'Read'],
                   ['Connection', row.connection_id],
                   ['Session', row.session_id],
                   ['Duration', row.duration_ms == null ? '—' : row.duration_ms + ' ms'],
@@ -741,6 +753,11 @@ function ConsoleApp() {
     ...(resource === 'calls'
       ? [
           {
+            key: 'effect',
+            label: 'Effect',
+            render: (r: Row) => (r.effect === 'write' ? 'Write' : 'Read'),
+          },
+          {
             key: 'duration_ms',
             label: 'Duration',
             render: (r: Row) => (r.duration_ms == null ? '—' : r.duration_ms + ' ms'),
@@ -998,8 +1015,8 @@ function ConsoleApp() {
                     >
                       {resource === 'connections' ? (
                         <>
-                          Connect GitHub or Slack through your backend or CLI after configuring the
-                          integration.{' '}
+                          Connect GitHub, Slack, or Gmail through your backend or CLI after
+                          configuring the integration.{' '}
                           <code className="command">
                             ravn connections connect --integration github --app-key-file … --user …
                           </code>
@@ -1041,7 +1058,7 @@ function ConsoleApp() {
                       </h2>
                       <Facts
                         items={[
-                          ['Provider', i.connector === 'slack' ? 'Slack' : 'GitHub'],
+                          ['Provider', PROVIDERS[i.connector] || i.connector],
                           ['Transport', 'Remote MCP'],
                           ['Endpoint', i.endpoint],
                           [
@@ -1066,6 +1083,13 @@ function ConsoleApp() {
                         <p className="muted">
                           Slack MCP requires an internal or Marketplace-published app with MCP
                           enabled. Personal user tokens only; no bot authority.
+                        </p>
+                      )}
+                      {i.connector === 'gmail' && (
+                        <p className="muted">
+                          Google's Gmail MCP server is in Developer Preview. Gmail read and compose
+                          scopes are restricted: external apps need Google verification. Drafts are
+                          never sent.
                         </p>
                       )}
                       <p className="muted">

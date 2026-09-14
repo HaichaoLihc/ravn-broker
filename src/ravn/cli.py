@@ -19,6 +19,7 @@ from ravn.common import RavnError, canonical
 from ravn.config import load_config
 from ravn.crypto import private_file
 from ravn.github import GitHub
+from ravn.gmail import Gmail
 from ravn.manifest import check_schema, schema_hash, schemas_for
 from ravn.slack import Slack
 
@@ -226,7 +227,7 @@ async def run(args):
         if integration is None or not integration.enabled:
             raise ValueError("Integration not found or disabled")
         credential = private_file(args.token_file).decode()
-        provider = (Slack if integration.connector == "slack" else GitHub)(
+        provider = {"slack": Slack, "gmail": Gmail}.get(integration.connector, GitHub)(
             config.limits.call_timeout_seconds, config.limits.result_bytes
         )
         await provider.identify(credential)

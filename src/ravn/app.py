@@ -1,6 +1,7 @@
 """FastAPI management and an official-SDK MCP app sharing one service instance."""
 
 import asyncio
+import re
 from contextlib import asynccontextmanager
 from typing import Literal
 from urllib.parse import urlsplit
@@ -19,6 +20,7 @@ from ravn.config import Config, Model
 from ravn.service import Service
 
 BODY_READ_TIMEOUT_SECONDS = 10
+IDEMPOTENCY = re.compile(r"[A-Za-z0-9._:-]{8,128}")
 
 
 class Credential(Model):
@@ -292,12 +294,10 @@ def create_app(config: Config, *, provider=None) -> FastAPI:
                     "unsupported_upstream_interaction",
                     "Only synchronous read calls are supported.",
                 )
-            if params.meta and "ravn/idempotency-key" in params.meta:
-                raise RavnError(
-                    400,
-                    "unsupported_feature",
-                    "Idempotency keys arrive with milestone 3; omit for reads.",
-                )
+            # A RAVN extension consumed here; providers only ever receive arguments.
+            key = (params.meta or {}).get("ravn/idempotency-key")
+            if key is not None and (not isinstance(key, str) or not IDEMPOTENCY.fullmatch(key)):
+                raise RavnError(400, "invalid_request", "Malformed idempotency key.")
             p = principal(ctx)
             return await service.execute(
                 p,
@@ -305,6 +305,7 @@ def create_app(config: Config, *, provider=None) -> FastAPI:
                 params.name,
                 params.arguments or {},
                 ctx.request.state.request_id,
+                idempotency_key=key,
             )
         except RavnError as error:
             raise MCPError(

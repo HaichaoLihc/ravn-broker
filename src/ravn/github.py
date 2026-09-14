@@ -58,6 +58,9 @@ class PinnedTransport(httpx2.AsyncBaseTransport):
             "github.com",
             "slack.com",
             "mcp.slack.com",
+            "gmailmcp.googleapis.com",
+            "oauth2.googleapis.com",
+            "openidconnect.googleapis.com",
         }:
             raise ValueError("Unknown provider host")
         self.host, self.limit = host, limit
@@ -117,6 +120,9 @@ class GitHub:
         "X-MCP-Toolsets": "issues",
         "X-MCP-Tools": "issue_read,list_issues",
     }
+    # GitHub also uses 403 for rate limits, so only providers whose 403 means
+    # "not permitted, not executed" opt in to treating it as a definite denial.
+    denied_status = None
 
     def __init__(self, timeout=30, result_limit=4194304, transport_factory=None):
         self.timeout, self.result_limit = timeout, result_limit
@@ -174,6 +180,12 @@ class GitHub:
                     401,
                     "credential_invalid",
                     "Provider rejected the account credential; reconnect.",
+                )
+            if self.denied_status and response.status_code == self.denied_status:
+                raise RavnError(
+                    403,
+                    "provider_denied",
+                    f"{self.label} refused this operation; check granted permissions and setup.",
                 )
 
         async with httpx2.AsyncClient(

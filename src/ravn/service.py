@@ -10,17 +10,32 @@ from collections import Counter
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 
+from mcp import types
+
 from ravn import control
 from ravn.common import Principal, RavnError, canonical, digest, identifier, now, token
 from ravn.config import Config
 from ravn.crypto import Cipher
 from ravn.github import GitHub
-from ravn.manifest import check_schema, schema_hash, schemas_for, validate_arguments
+from ravn.gmail import Gmail
+from ravn.manifest import check_schema, is_write, schema_hash, schemas_for, validate_arguments
 from ravn.oauth import Onboarding
 from ravn.slack import Slack
 from ravn.store import Store, event, finish, one, rows
 
 ACTOR = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:@/-]{0,127}$")
+# Provider answers that prove a dispatched request was refused, not executed.
+DEFINITE_REFUSALS = {"credential_invalid", "provider_denied"}
+
+
+class Replayed(RavnError):
+    """Carries a known earlier outcome out of admission without dispatching."""
+
+    def __init__(self, result):
+        super().__init__(200, "idempotency_replayed", "Earlier outcome replayed.")
+        self.result = result
+
+
 CONNECTION_FIELDS = (
     "id",
     "integration_id",
@@ -73,6 +88,9 @@ class Service:
         )
         self.providers.setdefault(
             "slack", Slack(config.limits.call_timeout_seconds, config.limits.result_bytes)
+        )
+        self.providers.setdefault(
+            "gmail", Gmail(config.limits.call_timeout_seconds, config.limits.result_bytes)
         )
         self.provider = self.providers["github_cloud"]  # Backward-compatible test/inspection hook.
         self.oauth = Onboarding(self)
@@ -375,10 +393,67 @@ class Service:
             await control.revoke_session(db, p, row)
             return public_session(row)
 
-    async def execute(self, p, cid, name, arguments, request_id):
+    async def previous_call(self, db, p, key_hash, fingerprint, request_id):
+        """Resolve a keyed request against its earlier call without dispatching."""
+        row = await one(
+            db,
+            "SELECT * FROM calls WHERE app_id=? AND tenant_id=? AND user_id=? AND idempotency_key_hash=?",
+            (*p.namespace, key_hash),
+        )
+        if row is None:
+            return None
+        if not hmac.compare_digest(row["arguments_fingerprint"], fingerprint):
+            raise RavnError(
+                409,
+                "idempotency_conflict",
+                "This idempotency key was already used for a different request.",
+            )
+        if row["status"] == "running":
+            raise RavnError(
+                409,
+                "call_in_progress",
+                "The same request is still running; check its status instead of retrying.",
+                call_id=row["id"],
+            )
+        if row["status"] == "unknown":
+            raise RavnError(
+                502,
+                "outcome_unknown",
+                "The earlier attempt may have executed. Reconcile before trying again.",
+                call_id=row["id"],
+            )
+        # Known outcome. Results are never retained, so the replay carries none.
+        return types.CallToolResult(
+            content=[
+                types.TextContent(
+                    type="text",
+                    text="This request already completed; its result is not retained.",
+                )
+            ],
+            isError=row["status"] == "tool_error",
+            _meta={
+                "ravn/call-id": row["id"],
+                "ravn/request-id": request_id,
+                "ravn/idempotency-replayed": True,
+            },
+        )
+
+    async def execute(self, p, cid, name, arguments, request_id, idempotency_key=None):
         async with self.store.transaction() as db:
             _, registered = await self.authorize(db, p, cid, execute=True, tool=name)
             validate_arguments(name, arguments, registered.connector)
+        write = is_write(name, registered.connector)
+        fingerprint = self.cipher.fingerprint([*p.namespace, cid, name, arguments])
+        key_hash = (
+            self.cipher.fingerprint([*p.namespace, "idempotency", idempotency_key])
+            if idempotency_key
+            else None
+        )
+        if key_hash:
+            async with self.store.transaction() as db:
+                replay = await self.previous_call(db, p, key_hash, fingerprint, request_id)
+            if replay:
+                return replay
         call_id, admitted, started = identifier("call"), False, time.monotonic()
         async with self.slots(p, cid):
             credential, integration = await self.credential(p, cid)
@@ -387,10 +462,18 @@ class Service:
                 nonlocal admitted
                 async with self.store.transaction() as db:
                     await self.authorize(db, p, cid, execute=True, tool=name)
+                    # Transactions are serialized, so a concurrent duplicate that
+                    # passed the early check is caught here, before dispatch.
+                    if key_hash and (
+                        replay := await self.previous_call(db, p, key_hash, fingerprint, request_id)
+                    ):
+                        raise Replayed(replay)
                     stamp = now()
-                    fingerprint = self.cipher.fingerprint([*p.namespace, cid, name, arguments])
                     await db.execute(
-                        "INSERT INTO calls VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        "INSERT INTO calls(id,app_id,tenant_id,user_id,connection_id,session_id,tool,"
+                        "status,arguments_fingerprint,fingerprint_key_id,error_code,duration_ms,"
+                        "created_at,updated_at,completed_at,effect,idempotency_key_hash) "
+                        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                         (
                             call_id,
                             *p.namespace,
@@ -405,6 +488,8 @@ class Service:
                             stamp,
                             stamp,
                             None,
+                            "write" if write else "read",
+                            key_hash,
                         ),
                     )
                     admitted = True
@@ -434,35 +519,51 @@ class Service:
                 }
                 return result
             except BaseException as exc:
+                if isinstance(exc, Replayed):
+                    return exc.result
                 if isinstance(exc, RavnError) and exc.code == "credential_invalid":
                     await self.oauth.rejected(p, cid, credential)
+                # After dispatch, a write only definitely did not happen when the
+                # provider refused the request itself. Everything else is ambiguous.
+                ambiguous = write and not (
+                    isinstance(exc, RavnError) and exc.code in DEFINITE_REFUSALS
+                )
                 if admitted:
                     code = exc.code if isinstance(exc, RavnError) else "upstream_unavailable"
-                    await finish(
-                        self.finish_call(
-                            p,
-                            call_id,
-                            "unknown" if isinstance(exc, asyncio.CancelledError) else "failed",
-                            code,
-                            started,
-                        )
-                    )
+                    status = "failed"
+                    if ambiguous:
+                        status, code = "unknown", "outcome_unknown"
+                    elif isinstance(exc, asyncio.CancelledError):
+                        status = "unknown"
+                    await finish(self.finish_call(p, call_id, status, code, started))
                 if isinstance(exc, asyncio.CancelledError):
                     raise
+                if admitted and ambiguous:
+                    raise RavnError(
+                        502,
+                        "outcome_unknown",
+                        "The write may have executed. Reconcile before trying again; nothing was retried.",
+                        call_id=call_id,
+                    ) from None
                 if isinstance(exc, RavnError):
-                    exc.call_id = call_id if admitted else None
+                    # Keep a call ID set by an earlier keyed call; never invent one.
+                    if admitted:
+                        exc.call_id = call_id
                     raise
                 raise RavnError(
                     503,
                     "dependency_unavailable",
-                    "Read operation could not complete.",
+                    "Tool call could not complete.",
                     call_id=call_id if admitted else None,
                 ) from None
 
     async def finish_call(self, p, call_id, status, code, started):
         async with self.store.transaction() as db:
+            # A definite failure releases its idempotency key so the same logical
+            # action can be retried, for example after reconnecting.
             cursor = await db.execute(
-                "UPDATE calls SET status=?,error_code=?,duration_ms=?,updated_at=?,completed_at=? "
+                "UPDATE calls SET status=?,error_code=?,duration_ms=?,updated_at=?,completed_at=?,"
+                "idempotency_key_hash=CASE WHEN ?='failed' THEN NULL ELSE idempotency_key_hash END "
                 "WHERE app_id=? AND tenant_id=? AND id=? AND status='running'",
                 (
                     status,
@@ -470,6 +571,7 @@ class Service:
                     int((time.monotonic() - started) * 1000),
                     now(),
                     now(),
+                    status,
                     p.app,
                     p.tenant,
                     call_id,
@@ -497,6 +599,7 @@ class Service:
                         "connection_id",
                         "session_id",
                         "tool",
+                        "effect",
                         "status",
                         "arguments_fingerprint",
                         "fingerprint_key_id",

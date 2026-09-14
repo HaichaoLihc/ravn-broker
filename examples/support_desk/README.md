@@ -2,8 +2,8 @@
 
 This is a working **end-user UI + FastAPI application backend**, separate from
 the RAVN operator console. No frontend build, LLM, or LLM API key is required.
-The runner executes explicitly selected read tools; it does not generate answers
-or autonomously choose actions.
+The runner executes explicitly selected tools (reads, plus Gmail drafts that are
+never sent); it does not generate answers or autonomously choose actions.
 
 ## Try it immediately
 
@@ -25,11 +25,29 @@ The launcher opens a private one-use login link. Then:
    use it. Already-running reads may finish. The browser clears its last result.
 6. Try GitHub: **Read an issue** → `acme` / `help-center` / `42`. Or connect both
    services and switch accounts. Reconnect replaces only that connection's authority.
+7. Try Gmail, the full support story: **Connect Gmail** → **Search threads**
+   (`refund`) → **Read a thread** → **Draft a reply (not sent)**. The draft form
+   is prefilled as a reply to Dana. Then **List drafts** shows exactly one draft.
 
 For Slack threads, the fixture is channel `C0123`, timestamp
 `1789142400.000100`. Search matches queries containing `refund`, `1042`, or
 `confirmation`; other queries return no matches. GitHub contains one fixture
 issue; another repository/issue returns an explicit simulated not-found result.
+Gmail has one thread, `18f2a0c4d5e6f701`, with messages `18f2a0c4d5e6f701` and
+`18f2a0c4d5e6f702`; search matches the same three words. Simulated drafts live
+in memory and are cleared when the demo stops, including with `--resume`.
+
+### Gmail drafts
+
+Drafting is the only write in this example, and drafts are never sent. Google's
+Gmail MCP server has no send tool, and RAVN does not expose its label tools.
+
+Each draft you create gets its own idempotency key from the browser. If the
+result is uncertain (for example, the connection drops after Gmail saved it),
+the app says so and the button changes to **Try again with the same draft**.
+That retry reuses the key, so RAVN reports the earlier outcome instead of saving
+a second copy. Editing the draft, or clicking the button again after a success,
+starts a new draft with a new key.
 
 **Demo means simulated provider accounts, OAuth, credentials, and data.** The
 application REST calls, browser-bound RAVN onboarding, encrypted credential
@@ -37,7 +55,7 @@ storage, session creation/revocation, schema validation, MCP discovery/execution
 and RAVN call records are real. App → RAVN uses localhost HTTP; RAVN → provider
 uses in-memory HTTP transports running real MCP SDK servers. No external
 provider network request is permitted by the simulator. This is not a live
-GitHub/Slack compatibility test.
+GitHub, Slack, or Gmail compatibility test.
 
 The isolated demo starts these loopback listeners:
 
@@ -89,8 +107,8 @@ starts only the customer app and talks to your existing RAVN over its public API
 It does not read RAVN's database, master key, or admin socket.
 
 1. Complete the [provider OAuth setup](../../docs/onboarding.md) in your RAVN
-   deployment. Configure integration IDs `github` and/or `slack` for one
-   application. The UI shows both; an unconfigured one fails explicitly.
+   deployment. Configure integration IDs `github`, `slack`, and/or `gmail` for
+   one application. The UI shows all three; an unconfigured one fails explicitly.
 2. Add this exact URL to that application's `return_urls` in RAVN configuration:
    `http://127.0.0.1:18880/connect/return`. Restart RAVN for config changes.
    This is **not** the provider OAuth callback; providers redirect to RAVN's
@@ -119,8 +137,8 @@ It does not read RAVN's database, master key, or admin socket.
 
 For multi-tenant applications add `--tenant-id YOUR_TENANT`. The IDs are assigned
 by this trusted local test launcher, **not supplied by the browser**. The app ID
-must match the key. GitHub/Slack live compatibility is still unverified; this
-example does not bypass RAVN's fail-closed schema or OAuth profile checks.
+must match the key. GitHub, Slack, and Gmail live compatibility is still
+unverified; this example does not bypass RAVN's fail-closed schema or OAuth profile checks.
 
 ## What the developer implements
 
@@ -130,6 +148,7 @@ example does not bypass RAVN's fail-closed schema or OAuth profile checks.
 | OAuth returns | `GET /connect/return` | Validate binding; consume completion once; recover via status read if needed |
 | View accounts / sessions | `GET /api/state` | List actor-owned connections and sessions |
 | Run read tool | `POST /api/run` | Check ownership, create/reuse 600-second runtime, MCP `tools/list` then `tools/call` |
+| Create draft | `POST /api/run` with `idempotency_key` | Same, and the key goes in MCP `_meta["ravn/idempotency-key"]`; never retried automatically |
 | Stop session | `POST /api/sessions/{id}/revoke` | Revoke actor-owned runtime, discard cached handle |
 | Disconnect | `POST /api/connections/{id}/disconnect` | Disable actor-owned connection, discard runtime handle |
 
@@ -152,9 +171,12 @@ Files:
 
 - End users choose accounts and can disconnect them or stop sessions. **There
   are no per-user scope toggles or resource-level policy editor.** This milestone
-  uses RAVN's operator-reviewed read-tool manifests, not dynamic session scopes.
+  uses RAVN's operator-reviewed tool manifests, not dynamic session scopes.
   Typed repository/channel fields are tool arguments, not persistent permission
   restrictions. Provider OAuth grants can be broader than RAVN's exposed tools.
+- Gmail `create_draft` is the only write. A Gmail session can read and draft;
+  there is no read-only Gmail session yet. An `outcome_unknown` result means the
+  draft may exist, so check Drafts before trying again.
 - Disconnect disables RAVN access; it does not uninstall the provider app or
   revoke the provider OAuth grant. Manage that separately at the provider.
 - Local login is for **one tester**, not production authentication. It uses a
@@ -172,8 +194,8 @@ Files:
   list. RAVN retains its normal operational records. Results themselves can
   contain sensitive account data; don't log them in a production integration.
 - Connections/sessions show at most 100 records with an explicit truncation
-  notice. No production pagination UI, background agent, streaming chat, writes,
-  delegation, custom scopes, external vault, or user invitation flow is included.
+  notice. No production pagination UI, background agent, streaming chat, sending
+  mail, delegation, custom scopes, external vault, or user invitation flow is included.
 - Restarting the app loses login/session handles, not live RAVN connections.
   Existing runtimes expire after at most ten minutes. No automatic read retry
   or silent replacement of a rejected bearer occurs within a run; the user can
@@ -190,6 +212,7 @@ uv run --locked ruff check examples/support_desk tests/test_support_desk.py
 
 Tests exercise both providers through the real RAVN OAuth and MCP stack,
 cancellation, callback/login replay protection, CSRF, actor isolation, credential
-non-disclosure, reconnect, session revocation, disconnect, read-only enforcement,
+non-disclosure, reconnect, session revocation, disconnect, write-tool enforcement,
+single-save drafts per idempotency key, uncertain draft outcomes,
 invalid arguments, and lost-completion-response recovery. Browser UI smoke
 testing uses the demo; it does not authorize a real provider account.

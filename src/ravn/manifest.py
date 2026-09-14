@@ -1,4 +1,4 @@
-"""Two reviewed read-only tool subsets. Provider schema pins require operator review."""
+"""Reviewed per-connector tool subsets. Provider schema pins require operator review."""
 
 import hashlib
 
@@ -56,9 +56,87 @@ SLACK_SCHEMAS["slack_read_thread"] = {
     },
 }
 
+PAGE_TOKEN = {"type": "string", "minLength": 1, "maxLength": 2048}
+GMAIL_ID = {"type": "string", "pattern": r"^[A-Za-z0-9_-]{1,128}$"}
+GMAIL_QUERY = {"type": "string", "minLength": 1, "maxLength": 2000}
+MESSAGE_FORMAT = {"type": "string", "enum": ["MINIMAL", "FULL_CONTENT", "METADATA_ONLY"]}
+# Plain addresses only; Google's server rejects "Name <address>" forms.
+RECIPIENTS = {
+    "type": "array",
+    "maxItems": 20,
+    "items": {
+        "type": "string",
+        "maxLength": 254,
+        "pattern": r"^[^@\s,;<>\"]{1,64}@[A-Za-z0-9.-]{1,253}$",
+    },
+}
+
+
+def gmail_object(properties, required=()):
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        **({"required": list(required)} if required else {}),
+        "properties": properties,
+    }
+
+
+GMAIL_SCHEMAS = {
+    "search_threads": gmail_object(
+        {
+            "query": GMAIL_QUERY,
+            "pageSize": {"type": "integer", "minimum": 1, "maximum": 20},
+            "pageToken": PAGE_TOKEN,
+        },
+        ["query"],
+    ),
+    "get_thread": gmail_object(
+        {"threadId": GMAIL_ID, "messageFormat": MESSAGE_FORMAT}, ["threadId"]
+    ),
+    "get_message": gmail_object(
+        {"messageId": GMAIL_ID, "messageFormat": MESSAGE_FORMAT}, ["messageId"]
+    ),
+    "list_labels": gmail_object(
+        {"pageSize": {"type": "integer", "minimum": 1, "maximum": 100}, "pageToken": PAGE_TOKEN}
+    ),
+    "list_drafts": gmail_object(
+        {
+            "query": GMAIL_QUERY,
+            "pageSize": {"type": "integer", "minimum": 1, "maximum": 20},
+            "pageToken": PAGE_TOKEN,
+        }
+    ),
+    # Plain text only: no HTML (tracking pixels) and no base64 attachments.
+    "create_draft": gmail_object(
+        {
+            "to": RECIPIENTS,
+            "cc": RECIPIENTS,
+            "bcc": RECIPIENTS,
+            "subject": {"type": "string", "maxLength": 998},
+            "body": {"type": "string", "minLength": 1, "maxLength": 50000},
+            "replyToMessageId": GMAIL_ID,
+        },
+        ["body"],
+    ),
+}
+
+# Tools that change provider state. They are never retried and an ambiguous
+# outcome is recorded as unknown rather than failed.
+WRITE_TOOLS = {"gmail": {"create_draft": "Create a Gmail draft. Drafts are never sent."}}
+MANIFESTS = {"github_cloud": SCHEMAS, "slack": SLACK_SCHEMAS, "gmail": GMAIL_SCHEMAS}
+DESCRIPTIONS = {
+    "github_cloud": "Read GitHub issues using {name}.",
+    "slack": "Read Slack using {name}.",
+    "gmail": "Read Gmail using {name}.",
+}
+
 
 def schemas_for(connector="github_cloud"):
-    return SLACK_SCHEMAS if connector == "slack" else SCHEMAS
+    return MANIFESTS[connector]
+
+
+def is_write(name: str, connector="github_cloud") -> bool:
+    return name in WRITE_TOOLS.get(connector, {})
 
 
 def schema_hash(tool: types.Tool) -> str:
@@ -110,12 +188,20 @@ def reviewed_tools(
             raise RavnError(
                 409, "schema_drift", "Reviewed tool schema changed; operator review required."
             )
+        if is_write(tool.name, connector):
+            description = WRITE_TOOLS[connector][tool.name]
+            annotations = types.ToolAnnotations(
+                readOnlyHint=False, destructiveHint=False, idempotentHint=False
+            )
+        else:
+            description = DESCRIPTIONS[connector].format(name=tool.name)
+            annotations = types.ToolAnnotations(readOnlyHint=True, destructiveHint=False)
         result.append(
             types.Tool(
                 name=tool.name,
-                description=f"Read {'Slack' if connector == 'slack' else 'GitHub issues'} using {tool.name}.",
+                description=description,
                 inputSchema=schemas[tool.name],
-                annotations=types.ToolAnnotations(readOnlyHint=True, destructiveHint=False),
+                annotations=annotations,
             )
         )
     return sorted(result, key=lambda t: t.name)

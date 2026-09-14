@@ -39,7 +39,7 @@
         <h2>Open your private test link</h2>
         <p>
           Use the one-time sign-in link created by the Support Desk launcher. It
-          signs you into this local example—not into GitHub or Slack.
+          signs you into this local example—not into GitHub, Slack, or Gmail.
         </p>
         <p>
           Restart the example to generate a fresh link. Your connections remain
@@ -54,7 +54,7 @@
               <span class="small" id="connection-count">0 connected</span>
             </div>
             <p class="section-description">
-              Your accounts. Only approved read tools.
+              Your accounts. Only approved tools; nothing is ever sent.
             </p>
             <div id="connection-cards"></div>
             <div class="privacy-note">
@@ -68,7 +68,7 @@
           <section class="playground">
             <div class="section-heading">
               <h2>Try your assistant’s tools</h2>
-              <span class="tag">READ ONLY</span>
+              <span class="tag">READS + DRAFTS</span>
             </div>
             <p class="section-description">
               A deterministic tool runner, not an LLM chat. See the complete
@@ -86,7 +86,9 @@
               </div>
               <div id="tool-fields" class="tool-fields"></div>
               <div class="run-footer">
-                <p id="run-help">Connect Slack or GitHub to get started.</p>
+                <p id="run-help">
+                  Connect Gmail, Slack, or GitHub to get started.
+                </p>
                 <button class="primary" id="run-button" type="submit" disabled>
                   Run read tool <span>↗</span>
                 </button>

@@ -153,7 +153,9 @@ async def test_restart_does_not_redispatch_running_call(config):
             ),
         )
         await db.execute(
-            "INSERT INTO calls VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO calls(id,app_id,tenant_id,user_id,connection_id,session_id,tool,status,"
+            "arguments_fingerprint,fingerprint_key_id,error_code,duration_ms,created_at,updated_at,"
+            "completed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 "call_test",
                 "demo",

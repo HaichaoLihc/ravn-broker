@@ -14,9 +14,10 @@ from mcp.server.transport_security import TransportSecuritySettings
 
 from ravn.app import create_app
 from ravn.common import RavnError
-from ravn.config import Config
+from ravn.config import GMAIL_COMPOSE, GMAIL_READONLY, Config
 from ravn.github import GitHub
-from ravn.manifest import SLACK_SCHEMAS, schema_hash
+from ravn.gmail import Gmail
+from ravn.manifest import GMAIL_SCHEMAS, SLACK_SCHEMAS, schema_hash
 from ravn.oauth_provider import deadline
 from ravn.slack import Slack
 from ravn.store import one, rows
@@ -24,12 +25,19 @@ from ravn.store import one, rows
 pytestmark = pytest.mark.anyio
 RETURN = "http://127.0.0.1:8800/return"
 APP_STATE = "app_transaction_0123456789"
+# Google reports the requested `email` scope in its long form.
+GMAIL_GRANTED = [
+    "openid",
+    "https://www.googleapis.com/auth/userinfo.email",
+    GMAIL_READONLY,
+    GMAIL_COMPOSE,
+]
 
 
 class OAuthFake(FakeGitHub):
-    def __init__(self, slack=False):
+    def __init__(self, slack=False, gmail=False):
         super().__init__()
-        self.slack = slack
+        self.slack, self.gmail = slack, gmail
         self.exchanges = []
         self.refreshes = []
         self.rotation_failure = False
@@ -37,6 +45,14 @@ class OAuthFake(FakeGitHub):
         self.rotation_entered = asyncio.Event()
         self.rotation_release = asyncio.Event()
         self.tokens = {}
+        if gmail:
+            self.tools = [types.Tool(name=n, inputSchema=s) for n, s in GMAIL_SCHEMAS.items()]
+            self.app = self.server.streamable_http_app(
+                streamable_http_path="/mcp/v1",
+                stateless_http=True,
+                json_response=True,
+                transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+            )
         if slack:
             self.tools = [types.Tool(name=n, inputSchema=s) for n, s in SLACK_SCHEMAS.items()]
             self.tools.append(
@@ -54,11 +70,11 @@ class OAuthFake(FakeGitHub):
             )
 
     def transport(self, host):
-        if host in {"api.githubcopilot.com", "mcp.slack.com"}:
+        if host in {"api.githubcopilot.com", "mcp.slack.com", "gmailmcp.googleapis.com"}:
             return httpx2.ASGITransport(app=self.app)
 
         async def request(req):
-            if req.url.path in {"/login/oauth/access_token", "/api/oauth.v2.user.access"}:
+            if req.url.path in {"/login/oauth/access_token", "/api/oauth.v2.user.access", "/token"}:
                 params = {k: v[0] for k, v in parse_qs(req.content.decode()).items()}
                 assert params["client_secret"] == "test-client-secret"
                 assert not req.url.query
@@ -77,11 +93,24 @@ class OAuthFake(FakeGitHub):
                     return httpx2.Response(
                         200, json={"error": "bad_verification_code", "echo": "SECRET"}
                     )
-                access = ("xoxp-" if self.slack else "ghu_") + who + ("-new" if refresh else "-old")
+                prefix = "ya29." if self.gmail else "xoxp-" if self.slack else "ghu_"
+                access = prefix + who + ("-new" if refresh else "-old")
                 self.tokens[access] = (
                     "T222" if who == "workspace" else "T111",
                     "U222" if who == "bob" else "U111",
                 )
+                if self.gmail:
+                    # Google's shape: URL scopes, and refresh never rotates the refresh token.
+                    return httpx2.Response(
+                        200,
+                        json={
+                            "access_token": access,
+                            "token_type": "Bearer",
+                            "expires_in": 3599,
+                            "scope": " ".join(GMAIL_GRANTED),
+                            **({} if refresh else {"refresh_token": "test-refresh-" + access}),
+                        },
+                    )
                 return httpx2.Response(
                     200,
                     json={
@@ -98,6 +127,16 @@ class OAuthFake(FakeGitHub):
             if access not in self.tokens:
                 return httpx2.Response(401, json={"ok": False, "error": "invalid_auth"})
             team, user = self.tokens[access]
+            if self.gmail:
+                bob = user == "U222"
+                return httpx2.Response(
+                    200,
+                    json={
+                        "sub": "202" if bob else "101",
+                        "email": "bob@example.com" if bob else "alice@example.com",
+                        "email_verified": True,
+                    },
+                )
             return httpx2.Response(
                 200,
                 json={
@@ -126,8 +165,24 @@ async def oauth_rig(config, tmp_path):
             "client_secret_file": str(secret),
             "profile": "github_app_pkce",
         }
-    github, slack = OAuthFake(), OAuthFake(slack=True)
+    github, slack, gmail = OAuthFake(), OAuthFake(slack=True), OAuthFake(gmail=True)
     for app in value["applications"]:
+        value["integrations"].append(
+            {
+                "id": "gmail",
+                "app_id": app["id"],
+                "connector": "gmail",
+                "endpoint": "https://gmailmcp.googleapis.com/mcp/v1",
+                "manifest": "builtin:gmail-v1",
+                "schema_hashes": {t.name: schema_hash(t) for t in gmail.tools},
+                "oauth": {
+                    "client_id": "test-google",
+                    "client_secret_file": str(secret),
+                    "profile": "google_web_pkce",
+                    "scopes": ["openid", "email", GMAIL_READONLY, GMAIL_COMPOSE],
+                },
+            }
+        )
         value["integrations"].append(
             {
                 "id": "slack",
@@ -152,11 +207,13 @@ async def oauth_rig(config, tmp_path):
         provider={
             "github_cloud": GitHub(transport_factory=github.transport),
             "slack": Slack(transport_factory=slack.transport),
+            "gmail": Gmail(transport_factory=gmail.transport),
         },
     )
     async with AsyncExitStack() as stack:
         await stack.enter_async_context(github.server.session_manager.run())
         await stack.enter_async_context(slack.server.session_manager.run())
+        await stack.enter_async_context(gmail.server.session_manager.run())
         await stack.enter_async_context(app.router.lifespan_context(app))
         http = await stack.enter_async_context(
             httpx.AsyncClient(
@@ -166,7 +223,8 @@ async def oauth_rig(config, tmp_path):
         key = (await app.state.service.create_key("demo", "test"))["key"]
         saas = (await app.state.service.create_key("saas", "test"))["key"]
         rig = Rig(app, http, github, key, saas)
-        rig.slack = slack
+        rig.slack, rig.gmail = slack, gmail
+        rig.fakes = {"github": github, "slack": slack, "gmail": gmail}
         yield rig
 
 
@@ -231,7 +289,7 @@ async def expire_credential(rig, cid):
         )
 
 
-@pytest.mark.parametrize("provider", ["github", "slack"])
+@pytest.mark.parametrize("provider", ["github", "slack", "gmail"])
 async def test_oauth_stages_then_activates_and_runs_real_mcp_sdk(oauth_rig, provider):
     rig = oauth_rig
     flow = await stage(rig, provider)
@@ -244,7 +302,7 @@ async def test_oauth_stages_then_activates_and_runs_real_mcp_sdk(oauth_rig, prov
     assert result.status_code == 200, result.text
     conn = result.json()
     assert conn["provider_account_id"] == ("T111:U111" if provider == "slack" else "101")
-    assert "ghu_" not in result.text and "xoxp-" not in result.text
+    assert all(prefix not in result.text for prefix in ("ghu_", "xoxp-", "ya29."))
     session = await rig.session(conn)
     async with rig.mcp(session) as client:
         tools = (await client.list_tools()).tools
@@ -253,6 +311,20 @@ async def test_oauth_stages_then_activates_and_runs_real_mcp_sdk(oauth_rig, prov
             result = await client.call_tool("slack_search_public", {"query": "project ravn"})
             assert rig.slack.calls[-1][0] == "xoxp-alice-old"
             assert "x-mcp-toolsets" not in rig.slack.headers[-1]
+        elif provider == "gmail":
+            assert {t.name for t in tools} == set(GMAIL_SCHEMAS)
+            assert conn["display_name"] == "alice@example.com"
+            result = await client.call_tool("search_threads", {"query": "refund"})
+            assert rig.gmail.calls[-1][0] == "ya29.alice-old"
+            authorize = flow["authorize"]
+            assert authorize["access_type"] == "offline" and authorize["prompt"] == "consent"
+            verifier = rig.gmail.exchanges[0]["code_verifier"]
+            assert (
+                authorize["code_challenge"]
+                == base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest())
+                .rstrip(b"=")
+                .decode()
+            )
         else:
             result = await client.call_tool("list_issues", {"owner": "acme", "repo": "test"})
             assert rig.fake.calls[-1][0] == "ghu_alice-old"
@@ -283,7 +355,8 @@ async def test_oauth_stages_then_activates_and_runs_real_mcp_sdk(oauth_rig, prov
             )
         )
         events = await rows(db, "SELECT * FROM events")
-        assert "test-refresh" not in repr(events) and "ghu_" not in repr(events)
+        assert "test-refresh" not in repr(events)
+        assert all(prefix not in repr(events) for prefix in ("ghu_", "xoxp-", "ya29."))
 
 
 async def test_browser_cookie_state_replay_and_duplicate_queries(oauth_rig):
@@ -378,7 +451,7 @@ async def test_provider_denial_and_failure_never_return_provider_diagnostics(oau
     assert "SECRET" not in str(flow)
 
 
-@pytest.mark.parametrize("provider", ["github", "slack"])
+@pytest.mark.parametrize("provider", ["github", "slack", "gmail"])
 async def test_reconnect_preserves_identity_invalidates_sessions(oauth_rig, provider):
     rig = oauth_rig
     conn = await connected(rig, provider)
@@ -409,7 +482,7 @@ async def test_disconnect_wins_pending_reconnect(oauth_rig):
         assert conn["ciphertext"] is None and conn["status"] == "disconnected"
 
 
-@pytest.mark.parametrize("provider", ["github", "slack"])
+@pytest.mark.parametrize("provider", ["github", "slack", "gmail"])
 async def test_refresh_single_flight_preserves_runtime_epoch(oauth_rig, provider):
     rig = oauth_rig
     conn = await connected(rig, provider)
@@ -417,8 +490,19 @@ async def test_refresh_single_flight_preserves_runtime_epoch(oauth_rig, provider
     await expire_credential(rig, conn["id"])
     p = await rig.service.authenticate_session(session["token"])
     values = await asyncio.gather(*(rig.service.discover(p, conn["id"]) for _ in range(4)))
-    fake = rig.slack if provider == "slack" else rig.fake
+    fake = rig.fakes[provider]
     assert len(fake.refreshes) == 1 and all(values)
+    if provider == "gmail":
+        # Google's refresh response omits the refresh token; the stable one is kept.
+        async with rig.service.store.transaction() as db:
+            row = await one(db, "SELECT * FROM connections WHERE id=?", (conn["id"],))
+        bundle = json.loads(
+            rig.service.cipher.decrypt(
+                row["ciphertext"], row["app_id"], row["tenant_id"], row["id"]
+            )
+        )
+        assert bundle["refresh_token"] == "test-refresh-ya29.alice-old"
+        assert bundle["access_token"] == "ya29.alice-new"
     async with rig.service.store.transaction() as db:
         row = await one(db, "SELECT * FROM connections WHERE id=?", (conn["id"],))
         assert (

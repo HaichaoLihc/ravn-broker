@@ -47,7 +47,7 @@ async def test_unreviewed_integration_cannot_issue_sessions(rig):
     assert not rig.fake.calls
 
 
-async def test_m1_rejects_future_restrictions_and_idempotency_keys(rig):
+async def test_rejects_future_restrictions_and_malformed_idempotency_keys(rig):
     conn = await rig.connection()
     response = await rig.http.post(
         "/v1/sessions",
@@ -58,11 +58,10 @@ async def test_m1_rejects_future_restrictions_and_idempotency_keys(rig):
     assert response.json()["error"]["code"] == "unsupported_constraint"
     session = await rig.session(conn)
     async with rig.mcp(session) as mcp:
-        with pytest.raises(MCPError) as error:
-            await mcp.session.call_tool(
-                "issue_read", ARGS, meta={"ravn/idempotency-key": "future-key"}
-            )
-        assert error.value.data["code"] == "unsupported_feature"
+        for key in ["short", "has spaces in it", 12345678]:
+            with pytest.raises(MCPError) as error:
+                await mcp.session.call_tool("issue_read", ARGS, meta={"ravn/idempotency-key": key})
+            assert error.value.data["code"] == "invalid_request"
     assert not rig.fake.calls
 
 

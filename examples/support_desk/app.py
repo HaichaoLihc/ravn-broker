@@ -43,11 +43,55 @@ HINTS = {
     "rate_limited": "Another operation is running. Wait for it to finish.",
     "upstream_unavailable": "The provider could not complete the read. No automatic retry was made.",
     "dependency_unavailable": "Cannot reach RAVN. Check the developer-side server configuration.",
+    "outcome_unknown": "The draft may have been saved. Check Gmail Drafts before trying again; nothing was retried.",
+    "call_in_progress": "That same draft request is still running. Wait, then check Drafts.",
+    "idempotency_conflict": "This retry changed the draft. Start a new draft instead.",
+    "insufficient_scope": "Grant every requested permission on the consent screen, then reconnect.",
+    "provider_denied": "The provider refused this action. Check the account's granted permissions.",
+}
+TOOLS = {
+    "github": {"issue_read", "list_issues"},
+    "slack": {"slack_search_public", "slack_search_public_and_private", "slack_read_thread"},
+    "gmail": {
+        "search_threads",
+        "get_thread",
+        "get_message",
+        "list_labels",
+        "list_drafts",
+        "create_draft",
+    },
+}
+# Writes always carry an idempotency key so an explicit retry cannot duplicate them.
+WRITES = {"create_draft"}
+# HTTP status for RAVN codes that arrive inside MCP errors; anything else is 502.
+RPC_STATUS = {
+    "unauthenticated": 401,
+    "permission_denied": 403,
+    "provider_denied": 403,
+    "insufficient_scope": 403,
+    "invalid_arguments": 400,
+    "connection_disabled": 409,
+    "connection_reauth_required": 409,
+    "idempotency_conflict": 409,
+    "call_in_progress": 409,
+    "rate_limited": 429,
 }
 
 
 def hashed(value):
     return hashlib.sha256(value.encode()).hexdigest()
+
+
+def leaf_error(exc):
+    """The meaningful error inside task-group wrappers raised by the MCP client."""
+    if isinstance(exc, AppError) or isinstance(
+        getattr(getattr(exc, "error", None), "data", None), dict
+    ):
+        return exc
+    for child in getattr(exc, "exceptions", ()):
+        if (found := leaf_error(child)) is not None:
+            return found
+    return None
 
 
 class AppError(Exception):
@@ -72,6 +116,7 @@ class RunBody(Body):
     connection_id: str = Field(pattern=r"^conn_[a-f0-9]{32}$")
     tool: str = Field(min_length=1, max_length=100)
     arguments: dict
+    idempotency_key: str | None = Field(default=None, pattern=r"^[A-Za-z0-9._:-]{8,128}$")
 
 
 @dataclass(repr=False)
@@ -183,9 +228,11 @@ class Desk:
         self.active += 1
         started = time.monotonic()
         step = "connection"
+        write = body.tool in WRITES
         entry = {
             "id": secrets.token_hex(8),
             "tool": body.tool,
+            "effect": "write" if write else "read",
             "connection_id": body.connection_id,
             "created_at": time.time(),
             "status": "running",
@@ -202,16 +249,10 @@ class Desk:
                     else "connection_disabled",
                     409,
                 )
-            allowed = {
-                "github": {"issue_read", "list_issues"},
-                "slack": {
-                    "slack_search_public",
-                    "slack_search_public_and_private",
-                    "slack_read_thread",
-                },
-            }
-            if body.tool not in allowed.get(connection["integration_id"], set()):
+            if body.tool not in TOOLS.get(connection["integration_id"], set()):
                 raise AppError("permission_denied", 403)
+            if write and not body.idempotency_key:
+                raise AppError("invalid_arguments", 400)
             entry["steps"].append("Account ownership checked by RAVN")
             step = "session"
             runtime = login.runtimes.get(body.connection_id)
@@ -247,7 +288,16 @@ class Desk:
                     if body.tool not in {t.name for t in tools.tools}:
                         raise AppError("permission_denied", 403)
                     entry["steps"].append("MCP tool discovered through RAVN")
-                    result = await client.call_tool(body.tool, body.arguments)
+                    if write:
+                        # The session-level call never loops on interactive input, so
+                        # nothing here can resend a write.
+                        result = await client.session.call_tool(
+                            body.tool,
+                            body.arguments,
+                            meta={"ravn/idempotency-key": body.idempotency_key},
+                        )
+                    else:
+                        result = await client.call_tool(body.tool, body.arguments)
             text = "\n\n".join(item.text for item in result.content if item.type == "text")
             if len(text.encode()) > 262144 or any(
                 secret in text for secret in (self.app_key, runtime["token"])
@@ -259,22 +309,33 @@ class Desk:
                 r"call_[a-f0-9]{32}", meta["ravn/call-id"]
             ):
                 entry["call_id"] = meta["ravn/call-id"]
-            entry["steps"].append("Read result received; no write was requested")
+            if not write:
+                entry["steps"].append("Read result received; no write was requested")
+            elif meta.get("ravn/idempotency-replayed") is True:
+                entry["steps"].append("Same draft request already completed; nothing new was saved")
+            else:
+                entry["steps"].append("Draft saved in Gmail; nothing was sent")
             entry["duration_ms"] = int((time.monotonic() - started) * 1000)
             return {**entry, "text": text or "The tool returned no text content."}
         except Exception as exc:
-            code = exc.code if isinstance(exc, AppError) else "upstream_unavailable"
+            leaf = leaf_error(exc) or exc
+            code = leaf.code if isinstance(leaf, AppError) else "upstream_unavailable"
+            status = leaf.status if isinstance(leaf, AppError) else 502
             # MCP errors from RAVN contain a structured, sanitized code. Never
             # serialize arbitrary SDK exceptions/headers into a browser response.
-            data = getattr(getattr(exc, "error", None), "data", None)
+            data = getattr(getattr(leaf, "error", None), "data", None)
             if isinstance(data, dict) and data.get("code") in HINTS:
                 code = data["code"]
+                status = RPC_STATUS.get(code, 502)
+                call_id = (data.get("details") or {}).get("call_id")
+                if isinstance(call_id, str) and re.fullmatch(r"call_[a-f0-9]{32}", call_id):
+                    entry["call_id"] = call_id
             if step == "mcp":
                 # Do not silently retry under replacement authority. A subsequent
                 # explicit user click can request a new session.
                 login.runtimes.pop(body.connection_id, None)
             entry.update(status="failed", error_code=code)
-            raise AppError(code, exc.status if isinstance(exc, AppError) else 502) from None
+            raise AppError(code, status) from None
         finally:
             if entry["status"] == "running":
                 entry["status"] = "interrupted"
@@ -432,7 +493,7 @@ def create_app(desk):
     @app.post("/api/connect")
     async def connect(request: Request, body: ConnectBody):
         login = desk.login(request)
-        if body.integration_id not in {"github", "slack"} or len(login.bindings) >= 8:
+        if body.integration_id not in TOOLS or len(login.bindings) >= 8:
             raise AppError("invalid_arguments", 400)
         binding = ConnectBinding.for_login(login.actor, login.id)
         flow = await desk.ravn(

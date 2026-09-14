@@ -7,8 +7,26 @@ const el = (tag, text, cls) => {
   return n;
 };
 let state,
-  busy = false;
+  busy = false,
+  // One key per logical draft. Reused only for an explicit retry of that same
+  // draft after an uncertain outcome; editing the draft starts a new action.
+  pendingDraftKey = null;
+const DEMO_THREAD = "18f2a0c4d5e6f701";
 const definitions = {
+  gmail: {
+    title: "Gmail",
+    icon: "@",
+    summary:
+      "Search customer email, read threads, and save draft replies. Drafts are never sent.",
+    tools: [
+      ["search_threads", "Search threads"],
+      ["get_thread", "Read a thread"],
+      ["get_message", "Read a message"],
+      ["list_labels", "List labels"],
+      ["list_drafts", "List drafts"],
+      ["create_draft", "Draft a reply (not sent)"],
+    ],
+  },
   github: {
     title: "GitHub",
     icon: "⌘",
@@ -55,6 +73,7 @@ async function api(path, body) {
       value.error?.message || "The request could not be completed.",
     );
     err.status = response.status;
+    err.code = value.error?.code;
     throw err;
   }
   return value;
@@ -78,7 +97,13 @@ function setBusy(value) {
     .querySelectorAll("#workspace button")
     .forEach((b) => (b.disabled = value));
   $("run-button").disabled = value || !$("account").value;
-  $("run-button").textContent = value ? "Working…" : "Run read tool ↗";
+  $("run-button").textContent = value
+    ? "Working…"
+    : $("tool").value !== "create_draft"
+      ? "Run read tool ↗"
+      : pendingDraftKey
+        ? "Try again with the same draft ↗"
+        : "Create draft (not sent) ↗";
   $("account").disabled = value || !$("account").options[0]?.value;
   $("tool").disabled = value || !$("account").value;
 }
@@ -216,30 +241,47 @@ function renderTools(selected, preserve = false) {
   renderFields(preserve);
   $("run-help").textContent = connection()
     ? "Your backend starts a 10-minute session when needed. RAVN checks access on every call."
-    : "Connect Slack or GitHub to get started.";
+    : "Connect Gmail, Slack, or GitHub to get started.";
 }
 function renderFields(preserve = false) {
   const root = $("tool-fields"),
     previous = {};
   if (preserve)
-    root.querySelectorAll("input").forEach((i) => (previous[i.name] = i.value));
+    root
+      .querySelectorAll("input, textarea")
+      .forEach((i) => (previous[i.name] = i.value));
   root.replaceChildren();
   const tool = $("tool").value,
     demo = state?.mode === "simulated";
-  const input = (name, title, value, wide = false, number = false) => {
+  const MAX = { query: 2000, subject: 998, body: 50000, to: 254 };
+  const input = (
+    name,
+    title,
+    value,
+    wide = false,
+    number = false,
+    optional = false,
+    multiline = false,
+  ) => {
     const label = el("label", title, wide ? "wide" : "");
-    const field = el("input");
+    const field = el(multiline ? "textarea" : "input");
     field.name = name;
-    field.required = true;
-    field.type = number ? "number" : "text";
+    field.required = !optional;
+    if (!multiline) field.type = number ? "number" : "text";
     field.value = previous[name] ?? value;
-    field.maxLength = name === "query" ? 2000 : 100;
+    field.maxLength = MAX[name] || 100;
     field.autocomplete = "off";
     if (number) {
       field.min = "1";
       field.max = "2147483647";
       field.step = "1";
     }
+    // Changing a draft makes it a different action with a new key.
+    if (tool === "create_draft")
+      field.addEventListener("input", () => {
+        pendingDraftKey = null;
+        setBusy(busy);
+      });
     label.append(field);
     root.append(label);
   };
@@ -253,6 +295,41 @@ function renderFields(preserve = false) {
   else if (tool === "slack_read_thread") {
     input("channel_id", "Channel ID", demo ? "C0123" : "");
     input("message_ts", "Thread timestamp", demo ? "1789142400.000100" : "");
+  } else if (tool === "search_threads")
+    input("query", "Gmail search", demo ? "refund" : "", true);
+  else if (tool === "get_thread")
+    input("threadId", "Thread ID", demo ? DEMO_THREAD : "");
+  else if (tool === "get_message")
+    input("messageId", "Message ID", demo ? DEMO_THREAD : "");
+  else if (tool === "create_draft") {
+    input("to", "To (one address)", demo ? "dana@example.com" : "");
+    input(
+      "replyToMessageId",
+      "Reply to message ID",
+      demo ? DEMO_THREAD : "",
+      false,
+      false,
+      true,
+    );
+    input(
+      "subject",
+      "Subject",
+      demo ? "Re: Refund for order #1042 has no confirmation" : "",
+      true,
+      false,
+      true,
+    );
+    input(
+      "body",
+      "Draft body",
+      demo
+        ? "Hi Dana,\n\nYour refund for order #1042 is approved and processing. The confirmation email was delayed; we have queued it again and you should see it shortly.\n\nThanks,\nAcme support"
+        : "",
+      true,
+      false,
+      false,
+      true,
+    );
   }
 }
 function renderSessions() {
@@ -269,7 +346,9 @@ function renderSessions() {
       el(
         "strong",
         (definitions[c?.integration_id]?.title || "Account") +
-          " · read-only session",
+          (c?.integration_id === "gmail"
+            ? " · session (reads + drafts)"
+            : " · read-only session"),
       ),
       el(
         "small",
@@ -356,8 +435,8 @@ async function refresh() {
   const demo = state.mode === "simulated";
   $("mode-label").textContent = demo ? "SIMULATED PROVIDERS" : "LIVE PROVIDERS";
   $("mode-detail").textContent = demo
-    ? "Real app → RAVN → MCP flow. GitHub, Slack, consent and returned data are local simulations. No real accounts are used."
-    : "Your real GitHub and Slack accounts. This example only exposes approved read tools.";
+    ? "Real app → RAVN → MCP flow. GitHub, Slack, Gmail, consent and returned data are local simulations. No real accounts are used."
+    : "Your real GitHub, Slack, and Gmail accounts. Only approved tools are exposed; Gmail drafts are never sent.";
   renderConnections();
   renderSelector();
   renderSessions();
@@ -374,26 +453,39 @@ $("account").addEventListener("change", () => {
   setBusy(busy);
 });
 $("tool").addEventListener("change", () => {
+  pendingDraftKey = null;
   renderFields();
   clearResult();
+  setBusy(busy);
 });
 $("refresh").addEventListener("click", () => action(refresh));
 $("run-form").addEventListener("submit", (event) => {
   event.preventDefault();
   action(async () => {
-    const args = Object.fromEntries(new FormData(event.target));
-    if ($("tool").value === "issue_read") {
+    const args = Object.fromEntries(new FormData(event.target)),
+      tool = $("tool").value;
+    if (tool === "issue_read") {
       args.method = "get";
       args.issue_number = Number(args.issue_number);
     }
-    if ($("tool").value.startsWith("slack_search")) args.limit = 5;
+    if (tool.startsWith("slack_search")) args.limit = 5;
+    if (tool === "search_threads" || tool === "list_drafts") args.pageSize = 5;
+    let idempotencyKey;
+    if (tool === "create_draft") {
+      args.to = [args.to];
+      for (const optional of ["subject", "replyToMessageId"])
+        if (!args[optional]) delete args[optional];
+      idempotencyKey = pendingDraftKey || crypto.randomUUID();
+    }
     $("result-meta").textContent = "Checking access and calling MCP…";
     try {
       const result = await api("/api/run", {
         connection_id: $("account").value,
-        tool: $("tool").value,
+        tool,
         arguments: args,
+        ...(idempotencyKey ? { idempotency_key: idempotencyKey } : {}),
       });
+      pendingDraftKey = null;
       $("empty-result").hidden = true;
       $("result").hidden = false;
       let text = result.text;
@@ -410,7 +502,16 @@ $("run-form").addEventListener("submit", (event) => {
       $("trace").replaceChildren(...result.steps.map((s) => el("li", s)));
       $("trace").hidden = false;
     } catch (e) {
-      $("result-meta").textContent = "Read did not complete";
+      // Only an uncertain outcome keeps the key, so "Try again" can never
+      // save the same draft twice. A definite failure starts fresh.
+      pendingDraftKey =
+        idempotencyKey &&
+        ["outcome_unknown", "call_in_progress"].includes(e.code)
+          ? idempotencyKey
+          : null;
+      $("result-meta").textContent = idempotencyKey
+        ? "Draft outcome needs checking"
+        : "Read did not complete";
       $("empty-result").hidden = true;
       $("result").hidden = false;
       $("result").textContent = e.message;

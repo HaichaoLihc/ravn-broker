@@ -1,13 +1,15 @@
 """Strict provider token parsing: only advertised user authority, never fallback."""
 
 import asyncio
+from urllib.parse import parse_qs, urlsplit
 
 import httpx2
 import pytest
 
 from ravn.common import RavnError
-from ravn.config import Integration
+from ravn.config import GMAIL_COMPOSE, GMAIL_READONLY, Integration
 from ravn.github import GitHub
+from ravn.gmail import Gmail
 from ravn.oauth_provider import OAuthProvider
 
 pytestmark = pytest.mark.anyio
@@ -93,6 +95,123 @@ async def test_nonexpiring_user_grant_and_invalid_grant(adapter):
     with pytest.raises(RavnError) as exc:
         await oauth.refresh({"refresh_token": "old"})
     assert exc.value.code == "connection_reauth_required" and "echoed" not in str(exc.value)
+
+
+GOOGLE_SCOPES = ["openid", "email", GMAIL_READONLY, GMAIL_COMPOSE]
+GRANTED = " ".join(
+    ["openid", "https://www.googleapis.com/auth/userinfo.email", GMAIL_READONLY, GMAIL_COMPOSE]
+)
+
+
+@pytest.fixture
+def google(tmp_path):
+    secret = tmp_path / "google-secret"
+    secret.write_text("google-secret-test")
+    secret.chmod(0o600)
+    return Integration(
+        id="gmail",
+        app_id="demo",
+        connector="gmail",
+        endpoint="https://gmailmcp.googleapis.com/mcp/v1",
+        manifest="builtin:gmail-v1",
+        oauth={
+            "profile": "google_web_pkce",
+            "client_id": "google-client",
+            "client_secret_file": secret,
+            "scopes": GOOGLE_SCOPES,
+        },
+    )
+
+
+def google_oauth(google, respond, requests=None):
+    def handler(request):
+        if requests is not None:
+            requests.append((str(request.url), parse_qs(request.content.decode())))
+        return respond(request)
+
+    provider = Gmail(transport_factory=lambda host: httpx2.MockTransport(handler))
+    return OAuthProvider(google, provider, "https://ravn.example/oauth/callback/demo/gmail")
+
+
+def token_response(**patch):
+    value = {
+        "access_token": "ya29.user",
+        "token_type": "Bearer",
+        "expires_in": 3599,
+        "refresh_token": "1//stable",
+        "scope": GRANTED,
+    }
+    return {k: v for k, v in {**value, **patch}.items() if v is not None}
+
+
+def test_google_authorize_requests_offline_pkce_with_exact_scopes(google):
+    url = google_oauth(google, None).authorize_url("state-value", "verifier-value")
+    parts = urlsplit(url)
+    query = parse_qs(parts.query)
+    assert (parts.scheme, parts.netloc, parts.path) == (
+        "https",
+        "accounts.google.com",
+        "/o/oauth2/v2/auth",
+    )
+    assert query["scope"] == [" ".join(GOOGLE_SCOPES)]
+    assert query["code_challenge_method"] == ["S256"] and query["code_challenge"][0]
+    assert query["access_type"] == ["offline"] and query["prompt"] == ["consent"]
+    assert query["include_granted_scopes"] == ["false"]
+
+
+async def test_google_exchange_sends_verifier_in_body_and_keeps_url_scopes(google):
+    requests = []
+    oauth = google_oauth(google, lambda r: httpx2.Response(200, json=token_response()), requests)
+    result = await oauth.exchange("code", "verifier-value")
+    url, body = requests[0]
+    assert url == "https://oauth2.googleapis.com/token"
+    assert body["code_verifier"] == ["verifier-value"] and body["client_id"] == ["google-client"]
+    assert result["refresh_token"] == "1//stable" and GMAIL_COMPOSE in result["granted_scopes"]
+
+
+@pytest.mark.parametrize(
+    "scope",
+    [
+        "openid https://www.googleapis.com/auth/userinfo.email " + GMAIL_READONLY,
+        "openid email " + GMAIL_COMPOSE,
+        None,
+    ],
+)
+async def test_google_unticked_scope_refuses_connection(google, scope):
+    oauth = google_oauth(google, lambda r: httpx2.Response(200, json=token_response(scope=scope)))
+    with pytest.raises(RavnError) as exc:
+        await oauth.exchange("code", "verifier")
+    assert exc.value.code == "insufficient_scope" and "ya29" not in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    "patch",
+    [
+        {"access_token": "ghu_not_google"},
+        {"token_type": "user"},
+        {"scope": GRANTED + "\n"},
+        {"expires_in": None},
+    ],
+)
+async def test_google_rejects_other_token_shapes(google, patch):
+    oauth = google_oauth(google, lambda r: httpx2.Response(200, json=token_response(**patch)))
+    with pytest.raises(RavnError) as exc:
+        await oauth.exchange("code", "verifier")
+    assert exc.value.code == "oauth_exchange_failed"
+
+
+async def test_google_refresh_keeps_its_stable_refresh_token(google):
+    oauth = google_oauth(
+        google, lambda r: httpx2.Response(200, json=token_response(refresh_token=None))
+    )
+    previous = {"refresh_token": "1//stable", "refresh_expires_at": "2026-12-01T00:00:00.000000Z"}
+    result = await oauth.refresh(previous)
+    assert result["access_token"] == "ya29.user" and result["refresh_token"] == "1//stable"
+    assert result["refresh_expires_at"] == previous["refresh_expires_at"]
+    rotated = google_oauth(
+        google, lambda r: httpx2.Response(200, json=token_response(refresh_token="1//new"))
+    )
+    assert (await rotated.refresh(previous))["refresh_token"] == "1//new"
 
 
 async def test_client_secret_file_permissions_enforced(adapter):

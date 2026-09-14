@@ -1,4 +1,4 @@
-# Connect GitHub or Slack
+# Connect GitHub, Slack, or Gmail
 
 Milestone 2 is implemented and tested locally. **Live provider compatibility is
 still unverified.** You register your own provider app; users authorize it. No
@@ -26,7 +26,7 @@ Newly initialized configs already contain the CLI URL. Two URLs have different j
 
 | URL | Register where | Purpose |
 |---|---|---|
-| `RAVN_PUBLIC_URL/oauth/callback/demo/github` or `/demo/slack` | Provider app settings | Provider returns its authorization code to RAVN |
+| `RAVN_PUBLIC_URL/oauth/callback/demo/github`, `/demo/slack`, or `/demo/gmail` | Provider app settings | Provider returns its authorization code to RAVN |
 | `http://127.0.0.1:8800/return` or your app's exact HTTPS URL | RAVN application's `return_urls` | RAVN returns a one-time completion code to your app/helper |
 
 For provider deployments, set `server.public_url` to your externally reachable
@@ -119,6 +119,86 @@ parameters/incompatible schemas fail closed and require adapter review; merely
 changing a hash cannot fix incompatible arguments. No posts, reactions, uploads,
 or other writes are enabled. See [Slack's official tool guidance](https://github.com/slackapi/slack-skills-plugin/blob/main/skills/slack-search/SKILL.md).
 
+## 2C. Gmail
+
+RAVN connects to Google's hosted Gmail MCP server,
+`https://gmailmcp.googleapis.com/mcp/v1`. It is in the Google Workspace
+Developer Preview, so its tools can change; pinned schemas then fail closed.
+See [Gmail MCP setup](https://developers.google.com/workspace/gmail/api/guides/configure-mcp-server).
+
+In Google Cloud:
+
+1. Create or pick a project. Enable the **Gmail API** and the **Gmail MCP API**,
+   and enroll the project in the Workspace Developer Preview.
+2. Configure the OAuth consent screen. Use **Internal** for a Workspace
+   organization. For **External**, add your testers as test users.
+3. Create an OAuth client of type **Web application**. Add
+   `RAVN_PUBLIC_URL/oauth/callback/demo/gmail` as an authorized redirect URI.
+
+```yaml
+  - id: gmail
+    app_id: demo
+    connector: gmail
+    transport: remote_mcp
+    endpoint: https://gmailmcp.googleapis.com/mcp/v1
+    manifest: builtin:gmail-v1
+    schema_hashes: {}
+    oauth:
+      profile: google_web_pkce
+      client_id: REPLACE_WITH_GOOGLE_CLIENT_ID
+      client_secret_file: /absolute/private/path/google-client-secret
+      scopes:
+        - openid
+        - email
+        - https://www.googleapis.com/auth/gmail.readonly
+        - https://www.googleapis.com/auth/gmail.compose
+```
+
+`openid`, `email`, and `gmail.readonly` are required. Leave out `gmail.compose`
+if you will not approve drafting; RAVN refuses a `create_draft` pin without it.
+No other Gmail scope is accepted.
+
+The `google_web_pkce` profile uses a confidential web client **and** PKCE S256.
+It asks for offline access with a fresh consent each time, so Google returns a
+refresh token. Google lets people untick scopes on its consent screen; RAVN
+refuses the connection unless every configured scope was granted. Google does
+not rotate refresh tokens, so RAVN keeps the stored one after a refresh. The
+account ID is Google's stable `sub`, and reconnect must use the same account.
+
+| Tool | RAVN-supported arguments |
+|---|---|
+| `search_threads` | `query` (Gmail search syntax), optional `pageSize` (1 to 20), `pageToken` |
+| `get_thread` | `threadId`, optional `messageFormat` (`MINIMAL`, `FULL_CONTENT`, `METADATA_ONLY`) |
+| `get_message` | `messageId`, optional `messageFormat` |
+| `list_labels` | optional `pageSize`, `pageToken` |
+| `list_drafts` | optional `query`, `pageSize` (1 to 20), `pageToken` |
+| `create_draft` | `body` (plain text), optional `to`, `cc`, `bcc` (plain addresses, up to 20 each), `subject`, `replyToMessageId` |
+
+`create_draft` saves a draft and never sends it. HTML bodies and attachments are
+not accepted. Label, unlabel, and create-label tools are never exposed.
+
+`gmail.readonly` and `gmail.compose` are **restricted scopes**. An External app
+serving more than its test users needs Google's app verification and a yearly
+security assessment. In Testing mode, refresh tokens expire after 7 days.
+
+### Writes and retries
+
+A write can carry an optional idempotency key in MCP
+`params._meta["ravn/idempotency-key"]` (8 to 128 of `A-Z a-z 0-9 . _ : -`).
+RAVN uses it locally and never forwards it to the provider.
+
+- **Same key, same request:** RAVN does not call Gmail again. It returns the
+  earlier outcome with `ravn/idempotency-replayed: true` and no result body.
+- **Same key, different request:** `idempotency_conflict`.
+- **Still running:** `call_in_progress`.
+- **No key:** every submission is a new action and can save another draft.
+
+RAVN never retries a write. If Gmail may have saved the draft but RAVN cannot be
+sure (a timeout or dropped connection after sending), the call is recorded as
+`unknown` and returns `outcome_unknown` with `retryable: false`. Check Drafts
+before trying again. A clear refusal from Google (HTTP 401 or 403) is recorded
+as `failed` and frees the key for a retry.
+
 ## 3. Connect and run
 
 Validate configuration, then start/restart the server:
@@ -135,7 +215,7 @@ uv run ravn app-key create --app demo --output .ravn/backend.key
 uv run ravn connections connect --integration slack --app-key-file .ravn/backend.key --user alice
 ```
 
-Use `--integration github` for GitHub. The command opens a one-use local browser
+Use `--integration github` for GitHub or `--integration gmail` for Gmail. The command opens a one-use local browser
 link, sets its own browser-binding cookie, waits up to 10 minutes, then prints
 **connection metadata only**. `--no-open` prints the sensitive link instead;
 do not share it. This local operator/development helper is not authentication
@@ -155,11 +235,12 @@ Empty pins allow account connection but block session creation.
 ```sh
 uv run ravn sessions create --app-key-file .ravn/backend.key --user alice --connection conn_REPLACE --output .ravn/slack-session.json
 uv run python examples/search_slack.py --session-file .ravn/slack-session.json --query "project status"
+uv run python examples/read_gmail.py --session-file .ravn/gmail-session.json --query "is:unread"
 ```
 
 Only the session URL/token goes to your MCP client. The provider credential
-stays in RAVN; the application key stays in your backend. GitHub and Slack use
-**separate connection-bound sessions**, not one aggregated token. Multi-tenant
+stays in RAVN; the application key stays in your backend. GitHub, Slack, and
+Gmail use **separate connection-bound sessions**, not one aggregated token. Multi-tenant
 commands also require `--tenant`. The optional console remains the supplied HTML
 UI, with real connection/OAuth lifecycle metadata and no secret values.
 
@@ -257,9 +338,10 @@ OAuth routes validate ticket/state/cookie/expiry instead; they never accept
 provider URLs. Callback paths include application ID because integration IDs
 are application-local.
 
-Schema-1/2 databases migrate transactionally to schema 3; old imported credentials
+Schema 1 to 3 databases migrate transactionally to schema 4, which adds each
+call's effect (read or write) and idempotency record. Old imported credentials
 remain readable without gaining refresh capability. Back up the database
-consistently and the key separately. Older binaries cannot use schema 3.
+consistently and the key separately. Older binaries cannot use schema 4.
 
 Before a live release, verify consent/callback, provider identity, a private
 disposable read, expected permission denial, expiry/refresh, reconnect, and

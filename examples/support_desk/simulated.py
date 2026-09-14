@@ -26,10 +26,89 @@ from starlette.responses import (
     RedirectResponse,
 )
 
-from ravn.manifest import SCHEMAS, SLACK_SCHEMAS
+from ravn.config import GMAIL_COMPOSE, GMAIL_READONLY
+from ravn.manifest import GMAIL_SCHEMAS, SCHEMAS, SLACK_SCHEMAS
 from ravn.oauth_provider import OAuthProvider
 
 from .app import STATIC, hashed
+
+# kind → (MCP host, MCP path, OAuth/identity hosts, schemas)
+PROFILES = {
+    "github": ("api.githubcopilot.com", "/mcp/", {"github.com", "api.github.com"}, SCHEMAS),
+    "slack": ("mcp.slack.com", "/mcp", {"slack.com"}, SLACK_SCHEMAS),
+    "gmail": (
+        "gmailmcp.googleapis.com",
+        "/mcp/v1",
+        {"oauth2.googleapis.com", "openidconnect.googleapis.com"},
+        GMAIL_SCHEMAS,
+    ),
+}
+ACCESS_PREFIX = {"github": "ghu_", "slack": "xoxp-", "gmail": "ya29."}
+# kind → (name, heading, account, what is granted) for the simulated consent page
+CONSENT = {
+    "github": (
+        "GitHub",
+        "Support Desk would like read access",
+        "maya-demo · acme/help-center",
+        "Read and list issues in the simulated repository. No write tools are exposed.",
+    ),
+    "slack": (
+        "Slack",
+        "Support Desk would like read access",
+        "Acme demo workspace · Maya (TDEMO / UDEMO)",
+        "Search public and private messages and read threads available to this simulated user. No write tools are exposed.",
+    ),
+    "gmail": (
+        "Gmail",
+        "Support Desk would like to read mail and create drafts",
+        "maya@acme-demo.example (simulated Google account)",
+        "Search and read mail, list labels and drafts, and save draft replies. Drafts are never sent, and no send tool exists.",
+    ),
+}
+GMAIL_THREAD = "18f2a0c4d5e6f701"
+GMAIL_MESSAGES = {
+    "18f2a0c4d5e6f701": {
+        "id": "18f2a0c4d5e6f701",
+        "threadId": GMAIL_THREAD,
+        "subject": "Refund for order #1042 has no confirmation",
+        "sender": "dana@example.com",
+        "toRecipients": ["support@acme-demo.example"],
+        "date": "2026-09-10T16:04:00Z",
+        "snippet": "I was told my refund was approved, but I never got a confirmation email.",
+        "plaintextBody": "Hi Acme support,\n\nI was told my refund for order #1042 was approved, but I never got a confirmation email and it is not on the order page. Can you confirm it is on the way?\n\nThanks,\nDana",
+        "labelIds": ["INBOX", "Label_7"],
+    },
+    "18f2a0c4d5e6f702": {
+        "id": "18f2a0c4d5e6f702",
+        "threadId": GMAIL_THREAD,
+        "subject": "Re: Refund for order #1042 has no confirmation",
+        "sender": "dana@example.com",
+        "toRecipients": ["support@acme-demo.example"],
+        "date": "2026-09-12T09:31:00Z",
+        "snippet": "Just following up. Is there any update on the refund confirmation?",
+        "plaintextBody": "Just following up. Is there any update on the refund confirmation for #1042?\n\nDana",
+        "labelIds": ["INBOX", "UNREAD", "Label_7"],
+    },
+}
+GMAIL_LABELS = [
+    {"labelId": "INBOX", "name": "INBOX"},
+    {"labelId": "Label_7", "name": "Support/Refunds", "threadsTotal": 1, "threadsUnread": 1},
+]
+
+
+class LossyTransport(httpx2.AsyncBaseTransport):
+    """Test switch: a draft is created upstream, then its reply never arrives."""
+
+    def __init__(self, provider):
+        self.provider, self.inner = provider, httpx2.ASGITransport(app=provider.app)
+
+    async def handle_async_request(self, request):
+        calling = b"tools/call" in await request.aread()
+        response = await self.inner.handle_async_request(request)
+        if calling and self.provider.lose_response_after_draft:
+            await response.aread()
+            raise httpx2.ReadError("Simulated connection loss after dispatch", request=request)
+        return response
 
 
 class SimulatedProvider:
@@ -37,15 +116,21 @@ class SimulatedProvider:
         self.kind, self.secret = kind, secret
         self.tokens, self.refreshes, self.codes = set(), set(), {}
         self.calls = []
-        self.tools = [
-            types.Tool(name=n, inputSchema=s)
-            for n, s in (SLACK_SCHEMAS if kind == "slack" else SCHEMAS).items()
-        ]
+        self.drafts = []
+        self.lose_response_after_draft = False
+        self.mcp_host, path, self.auth_hosts, schemas = PROFILES[kind]
+        self.tools = [types.Tool(name=n, inputSchema=s) for n, s in schemas.items()]
+        if kind == "gmail":
+            # Google's server also offers label writes that RAVN never reviews.
+            self.tools += [
+                types.Tool(name=name, inputSchema={"type": "object"})
+                for name in ("label_thread", "create_label")
+            ]
         self.server = Server(
             "simulated-" + kind, on_list_tools=self.list_tools, on_call_tool=self.call_tool
         )
         self.app = self.server.streamable_http_app(
-            streamable_http_path="/mcp" if kind == "slack" else "/mcp/",
+            streamable_http_path=path,
             stateless_http=True,
             json_response=True,
             # In-memory ASGI transport only. This app never has a network listener.
@@ -68,7 +153,9 @@ class SimulatedProvider:
         args = params.arguments or {}
         result = {"simulated": True, "provider": self.kind, "tool": params.name}
         error = False
-        if self.kind == "github":
+        if self.kind == "gmail":
+            error = self.gmail(params.name, args, result)
+        elif self.kind == "github":
             if (
                 args.get("owner") != "acme"
                 or args.get("repo") != "help-center"
@@ -127,6 +214,61 @@ class SimulatedProvider:
             content=[types.TextContent(type="text", text=json.dumps(result))], isError=error
         )
 
+    def gmail(self, name, args, result):
+        """Fill result for one Gmail tool; return True for a tool-level error."""
+        words = ("refund", "1042", "confirmation")
+        if name == "search_threads":
+            query = args.get("query", "").lower()
+            first = GMAIL_MESSAGES["18f2a0c4d5e6f701"]
+            result["threads"] = (
+                [
+                    {
+                        "id": GMAIL_THREAD,
+                        "subject": first["subject"],
+                        "sender": first["sender"],
+                        "snippet": first["snippet"],
+                        "messageCount": len(GMAIL_MESSAGES),
+                    }
+                ]
+                if any(word in query for word in words)
+                else []
+            )
+            result["resultCountEstimate"] = len(result["threads"])
+        elif name == "get_thread":
+            if args.get("threadId") != GMAIL_THREAD:
+                result["message"] = f"This simulation contains thread {GMAIL_THREAD} only."
+                return True
+            result["thread"] = {"id": GMAIL_THREAD, "messages": list(GMAIL_MESSAGES.values())}
+        elif name == "get_message":
+            if args.get("messageId") not in GMAIL_MESSAGES:
+                result["message"] = "This simulation contains the two messages in its one thread."
+                return True
+            result["message"] = GMAIL_MESSAGES[args["messageId"]]
+        elif name == "list_labels":
+            result["labels"] = GMAIL_LABELS
+        elif name == "list_drafts":
+            query = args.get("query", "").lower()
+            result["drafts"] = [
+                d
+                for d in self.drafts
+                if not query or query in (d["subject"] + " " + d["plaintextBody"]).lower()
+            ]
+        elif name == "create_draft":
+            reply_to = GMAIL_MESSAGES.get(args.get("replyToMessageId"))
+            draft = {
+                "id": "r-simulated-" + str(len(self.drafts) + 1),
+                "subject": args.get("subject", ""),
+                "threadId": reply_to["threadId"] if reply_to else None,
+                "toRecipients": args.get("to", []),
+                "ccRecipients": args.get("cc", []),
+                "bccRecipients": args.get("bcc", []),
+                "plaintextBody": args["body"],
+                "date": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            }
+            self.drafts.append(draft)
+            result.update(draft=draft, note="Draft saved. Nothing was sent.")
+        return False
+
     def code(self, query):
         value = secrets.token_urlsafe(32)
         now = time.monotonic()
@@ -135,24 +277,26 @@ class SimulatedProvider:
         return value
 
     def transport(self, host):
-        if host == ("mcp.slack.com" if self.kind == "slack" else "api.githubcopilot.com"):
+        if host == self.mcp_host:
+            if self.kind == "gmail":
+                return LossyTransport(self)
             return httpx2.ASGITransport(app=self.app)
-        if host not in (
-            {"slack.com"} if self.kind == "slack" else {"github.com", "api.github.com"}
-        ):
+        if host not in self.auth_hosts:
             raise ValueError("The simulator never permits external network access")
 
         async def request(req):
-            if req.url.path in {"/login/oauth/access_token", "/api/oauth.v2.user.access"}:
+            if req.url.path in {"/login/oauth/access_token", "/api/oauth.v2.user.access", "/token"}:
                 p = {k: v[0] for k, v in parse_qs(req.content.decode()).items()}
                 valid = (
                     p.get("client_secret") == self.secret
                     and p.get("client_id") == "simulated-" + self.kind
                 )
-                if p.get("grant_type") == "refresh_token":
+                refreshing = p.get("grant_type") == "refresh_token"
+                if refreshing:
                     refresh = p.get("refresh_token")
                     valid = valid and refresh in self.refreshes
-                    self.refreshes.discard(refresh)
+                    if self.kind != "gmail":  # Google keeps one stable refresh token.
+                        self.refreshes.discard(refresh)
                 else:
                     saved = self.codes.pop(hashed(p.get("code", "")), None)
                     valid = (
@@ -161,7 +305,7 @@ class SimulatedProvider:
                         and saved[1] > time.monotonic()
                         and p.get("redirect_uri") == saved[0]["redirect_uri"]
                     )
-                    if valid and self.kind == "github":
+                    if valid and self.kind in {"github", "gmail"}:
                         challenge = (
                             base64.urlsafe_b64encode(
                                 hashlib.sha256(p.get("code_verifier", "").encode()).digest()
@@ -172,13 +316,27 @@ class SimulatedProvider:
                         valid = challenge == saved[0].get("code_challenge")
                 if not valid:
                     return httpx2.Response(400, json={"error": "invalid_grant"})
-                access = (
-                    ("xoxp-" if self.kind == "slack" else "ghu_")
-                    + "simulated-"
-                    + secrets.token_urlsafe(24)
-                )
-                refresh = "simulated-refresh-" + secrets.token_urlsafe(24)
+                access = ACCESS_PREFIX[self.kind] + "simulated-" + secrets.token_urlsafe(24)
                 self.tokens.add(access)
+                if self.kind == "gmail":
+                    value = {
+                        "access_token": access,
+                        "token_type": "Bearer",
+                        "expires_in": 3599,
+                        "scope": " ".join(
+                            [
+                                "openid",
+                                "https://www.googleapis.com/auth/userinfo.email",
+                                GMAIL_READONLY,
+                                GMAIL_COMPOSE,
+                            ]
+                        ),
+                    }
+                    if not refreshing:
+                        value["refresh_token"] = "simulated-refresh-" + secrets.token_urlsafe(24)
+                        self.refreshes.add(value["refresh_token"])
+                    return httpx2.Response(200, json=value)
+                refresh = "simulated-refresh-" + secrets.token_urlsafe(24)
                 self.refreshes.add(refresh)
                 return httpx2.Response(
                     200,
@@ -194,11 +352,20 @@ class SimulatedProvider:
                         else "",
                     },
                 )
-            if req.url.path not in {"/user", "/api/auth.test"}:
+            if req.url.path not in {"/user", "/api/auth.test", "/v1/userinfo"}:
                 return httpx2.Response(404)
             access = req.headers.get("authorization", "").removeprefix("Bearer ")
             if access not in self.tokens:
                 return httpx2.Response(401, json={"ok": False, "error": "invalid_auth"})
+            if self.kind == "gmail":
+                return httpx2.Response(
+                    200,
+                    json={
+                        "sub": "104200000000000000042",
+                        "email": "maya@acme-demo.example",
+                        "email_verified": True,
+                    },
+                )
             return httpx2.Response(
                 200,
                 json={
@@ -218,8 +385,13 @@ class SimulatedOAuth(OAuthProvider):
 
     def authorize_url(self, state, verifier):
         real_url = super().authorize_url(state, verifier)
-        kind = "slack" if self.slack else "github"
-        return self.consent_origin + "/authorize/" + kind + "?" + urlsplit(real_url).query
+        return (
+            self.consent_origin
+            + "/authorize/"
+            + self.integration.id
+            + "?"
+            + urlsplit(real_url).query
+        )
 
 
 def consent_app(providers, origin, ravn_origin, app_id, app_origin):
@@ -269,7 +441,7 @@ def consent_app(providers, origin, ravn_origin, app_id, app_origin):
             return PlainTextResponse("Too many simulated authorizations", status_code=429)
         ticket, browser = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
         pending[hashed(ticket)] = (kind, query, now + 300, hashed(browser))
-        name = "Slack" if kind == "slack" else "GitHub"
+        name, heading, account, access = CONSENT[kind]
         response = HTMLResponse(
             f'''<!doctype html><html lang="en"><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -279,9 +451,9 @@ def consent_app(providers, origin, ravn_origin, app_id, app_origin):
 <main><div class="eyebrow">SIMULATED PROVIDER · NO REAL ACCOUNT</div>
 <div class="hero"><div><h1>Connect your<br>{name} context.</h1>
 <p>This page stands in for {name}'s authorization screen.<br>It uses made-up accounts, credentials, and content.</p></div></div>
-<section class="locked"><h2>Support Desk would like read access</h2>
-<p>Account: <strong>{"Acme demo workspace · Maya (TDEMO / UDEMO)" if kind == "slack" else "maya-demo · acme/help-center"}</strong></p>
-<p>{"Search public and private messages and read threads available to this simulated user." if kind == "slack" else "Read and list issues in the simulated repository."} No write tools are exposed.</p>
+<section class="locked"><h2>{heading}</h2>
+<p>Account: <strong>{account}</strong></p>
+<p>{access}</p>
 <p>Continue to test the real RAVN OAuth callback, encrypted credential storage, session creation, and MCP gateway. No request goes to the real {name} service.</p>
 <form method="post" action="/consent"><input type="hidden" name="ticket" value="{html.escape(ticket, quote=True)}">
 <button name="decision" value="allow" class="primary">Allow simulated access →</button>

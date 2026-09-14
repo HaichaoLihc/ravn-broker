@@ -1,19 +1,20 @@
 # RAVN Python broker — milestones 1–2
 
-A headless, read-only MCP broker built with FastAPI and the official Python MCP SDK.
-This package is independent of the legacy Rust project and existing demos.
+A headless MCP broker built with FastAPI and the official Python MCP SDK. It
+exposes reviewed read tools, plus one reviewed write: Gmail drafts, which are
+never sent. This package is independent of the legacy Rust project and existing demos.
 
-**Live GitHub and Slack compatibility remains unverified.** Milestone 0 was
+**Live GitHub, Slack, and Gmail compatibility remains unverified.** Milestone 0 was
 skipped at the user's request. Tests use local fake identity/OAuth providers and
 real MCP SDK clients/servers, not live accounts. No external writes were made.
 
-**New: [GitHub/Slack OAuth setup and developer journey](docs/onboarding.md).**
+**New: [GitHub/Slack/Gmail OAuth setup and developer journey](docs/onboarding.md).**
 Connect from the CLI with `ravn connections connect --integration slack`, or
 use the same REST onboarding flow from your own authenticated backend.
 
 **Try the customer experience: [Support Desk example](examples/support_desk/README.md).**
-A separate FastAPI developer app and end-user UI: connect GitHub/Slack, run read
-tools, stop sessions, and disconnect. From `broker/`, run
+A separate FastAPI developer app and end-user UI: connect GitHub/Slack/Gmail, run
+read tools, save Gmail drafts, stop sessions, and disconnect. From `broker/`, run
 `uv run --locked python -m examples.support_desk --demo` for an isolated RAVN
 with clearly labeled simulated providers, or use `--live` with your configured broker.
 
@@ -30,6 +31,10 @@ with clearly labeled simulated providers, or use `--live` with your configured b
 - GitHub App user OAuth (PKCE), Slack confidential user OAuth, browser-bound staging/completion.
 - Encrypted token bundles, single-flight refresh, safe same-account reconnect and recovery.
 - Slack's official remote MCP: public/private search and thread reads (reviewed pins required).
+- Google's hosted Gmail MCP (Developer Preview): search, thread/message/label/draft reads, and
+  `create_draft`. Google web OAuth with PKCE, granted-scope checks, and non-rotating refresh.
+- Reviewed writes over MCP: optional `ravn/idempotency-key`, no automatic retry, and
+  ambiguous outcomes recorded as `unknown` (`outcome_unknown`).
 - Browser CLI onboarding, a small application-login binding helper, stored-credential schema inspection.
 
 ## Operator console
@@ -62,8 +67,8 @@ deployment**. One-hour browser sessions end on logout/restart. Readiness and sav
 connection state do not establish live provider availability. No Sites service,
 cloud hosting, external runtime assets, or production demo data is used.
 
-Existing schema-1/2 databases migrate transactionally to schema 3 on startup,
-preserving prior events and imported credentials. Missing legacy actor attribution stays unknown.
+Existing schema 1 to 3 databases migrate transactionally to schema 4 on startup,
+preserving prior calls, events, and imported credentials. Missing legacy actor attribution stays unknown.
 Back up existing state consistently before upgrading. Runtime console sessions
 and single-use login tickets are memory-only; operational records remain in SQLite.
 
@@ -79,11 +84,12 @@ npm test
 The development sources live in `broker/console/`, separate from the legacy
 Rust/Svelte `console/`. See [console development notes](console/README.md).
 
-Not included: write tools/idempotency keys,
-REST tool execution, application-facing activity listing, TypeScript helper (milestone 3), or vault adapters.
+Not included: writes other than Gmail drafts, REST tool execution (writes and
+idempotency keys are MCP-only), application-facing activity listing, TypeScript
+helper (milestone 3), or vault adapters.
 The larger [design API](../docs/design/headless-ravn-v1.openapi.yaml) is a target,
-not a claim that all its routes ship here. Unsupported restrictions and idempotency
-metadata fail explicitly; do not pass them to this milestone.
+not a claim that all its routes ship here. Unsupported session restrictions fail
+explicitly; do not pass them to this milestone.
 
 ## Install and test
 

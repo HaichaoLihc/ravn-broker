@@ -98,12 +98,46 @@ class Application(Model):
         return self
 
 
+GMAIL_READONLY = "https://www.googleapis.com/auth/gmail.readonly"
+GMAIL_COMPOSE = "https://www.googleapis.com/auth/gmail.compose"
+SLACK_SCOPES = {
+    "search:read.public",
+    "search:read.private",
+    "search:read.im",
+    "search:read.mpim",
+    "channels:history",
+    "groups:history",
+    "im:history",
+    "mpim:history",
+}
+# Each connector is one fixed provider profile; configuration selects a row and
+# can never point a connector at another destination or OAuth profile.
+CONNECTORS = {
+    "github_cloud": {
+        "endpoint": "https://api.githubcopilot.com/mcp/",
+        "manifest": "builtin:github-issues-v1",
+        "oauth_profile": "github_app_pkce",
+    },
+    "slack": {
+        "endpoint": "https://mcp.slack.com/mcp",
+        "manifest": "builtin:slack-read-v1",
+        "oauth_profile": "slack_user_confidential",
+    },
+    "gmail": {
+        "endpoint": "https://gmailmcp.googleapis.com/mcp/v1",
+        "manifest": "builtin:gmail-v1",
+        "oauth_profile": "google_web_pkce",
+    },
+}
+
+
 class OAuthConfig(Model):
     client_id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.-]+$")
     client_secret_file: Path
     # GitHub requires S256. Slack's confidential server profile does not enable
     # its irreversible public-client PKCE setting; this is not an auto-downgrade.
-    profile: Literal["github_app_pkce", "slack_user_confidential"]
+    # Google web clients are confidential and also use S256.
+    profile: Literal["github_app_pkce", "slack_user_confidential", "google_web_pkce"]
     scopes: list[str] = Field(default_factory=list, max_length=8)
 
     @model_validator(mode="after")
@@ -116,13 +150,15 @@ class OAuthConfig(Model):
 class Integration(Model):
     id: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$")
     app_id: str
-    connector: Literal["github_cloud", "slack"] = "github_cloud"
+    connector: Literal["github_cloud", "slack", "gmail"] = "github_cloud"
     transport: Literal["remote_mcp"] = "remote_mcp"
-    endpoint: Literal["https://api.githubcopilot.com/mcp/", "https://mcp.slack.com/mcp"] = (
-        "https://api.githubcopilot.com/mcp/"
-    )
+    endpoint: Literal[
+        "https://api.githubcopilot.com/mcp/",
+        "https://mcp.slack.com/mcp",
+        "https://gmailmcp.googleapis.com/mcp/v1",
+    ] = "https://api.githubcopilot.com/mcp/"
     enabled: bool = True
-    manifest: Literal["builtin:github-issues-v1", "builtin:slack-read-v1"] = (
+    manifest: Literal["builtin:github-issues-v1", "builtin:slack-read-v1", "builtin:gmail-v1"] = (
         "builtin:github-issues-v1"
     )
     schema_hashes: dict[str, str] = Field(default_factory=dict)
@@ -134,35 +170,32 @@ class Integration(Model):
 
         from ravn.manifest import schemas_for
 
-        slack = self.connector == "slack"
-        if self.endpoint != (
-            "https://mcp.slack.com/mcp" if slack else "https://api.githubcopilot.com/mcp/"
-        ) or self.manifest != ("builtin:slack-read-v1" if slack else "builtin:github-issues-v1"):
+        profile = CONNECTORS[self.connector]
+        if self.endpoint != profile["endpoint"] or self.manifest != profile["manifest"]:
             raise ValueError(
                 "Connector, endpoint, and manifest must match the fixed provider profile"
             )
         if not set(self.schema_hashes) <= set(schemas_for(self.connector)):
-            raise ValueError("Only the connector's reviewed read tools may be pinned")
+            raise ValueError("Only the connector's reviewed tools may be pinned")
         if any(not re.fullmatch(r"[a-f0-9]{64}", v) for v in self.schema_hashes.values()):
             raise ValueError("Schema pins must be SHA-256 hex digests")
         if self.oauth:
-            if self.oauth.profile != ("slack_user_confidential" if slack else "github_app_pkce"):
+            if self.oauth.profile != profile["oauth_profile"]:
                 raise ValueError("OAuth profile must match the connector")
-            allowed = (
-                {
-                    "search:read.public",
-                    "search:read.private",
-                    "search:read.im",
-                    "search:read.mpim",
-                    "channels:history",
-                    "groups:history",
-                    "im:history",
-                    "mpim:history",
-                }
-                if slack
-                else set()
-            )
-            if not set(self.oauth.scopes) <= allowed or (slack and not self.oauth.scopes):
+            scopes = set(self.oauth.scopes)
+            if self.connector == "gmail":
+                required = {"openid", "email", GMAIL_READONLY}
+                if not required <= scopes or not scopes <= required | {GMAIL_COMPOSE}:
+                    raise ValueError(
+                        "Gmail needs openid, email, and gmail.readonly; only gmail.compose may be added"
+                    )
+                # Compose may be granted before create_draft is reviewed, so onboarding
+                # does not need a second consent; approving the write requires it.
+                if "create_draft" in self.schema_hashes and GMAIL_COMPOSE not in scopes:
+                    raise ValueError("Approving create_draft requires the gmail.compose scope")
+            elif not scopes <= (SLACK_SCOPES if self.connector == "slack" else set()) or (
+                self.connector == "slack" and not scopes
+            ):
                 raise ValueError(
                     "Configure only reviewed Slack read scopes; GitHub App permissions are configured at GitHub"
                 )

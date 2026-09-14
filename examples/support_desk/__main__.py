@@ -31,13 +31,25 @@ def private_write(path, text):
 async def simulated_ravn(directory, app_origin, ravn_origin, consent_origin, *, resume=False):
     # Demo-only dependencies never enter the developer app's live code path.
     from ravn.app import create_app as broker_app
-    from ravn.config import Config
+    from ravn.config import CONNECTORS, GMAIL_COMPOSE, GMAIL_READONLY, Config
     from ravn.github import GitHub
-    from ravn.manifest import schema_hash
+    from ravn.gmail import Gmail
+    from ravn.manifest import schema_hash, schemas_for
     from ravn.slack import Slack
     from ravn.store import rows
 
-    from .simulated import SimulatedOAuth, SimulatedProvider, consent_app
+    from .simulated import ACCESS_PREFIX, SimulatedOAuth, SimulatedProvider, consent_app
+
+    # integration ID → (connector, provider class, OAuth scopes)
+    kinds = {
+        "github": ("github_cloud", GitHub, []),
+        "slack": (
+            "slack",
+            Slack,
+            ["search:read.public", "search:read.private", "channels:history", "groups:history"],
+        ),
+        "gmail": ("gmail", Gmail, ["openid", "email", GMAIL_READONLY, GMAIL_COMPOSE]),
+    }
 
     if resume:
         info = directory.stat()
@@ -54,33 +66,29 @@ async def simulated_ravn(directory, app_origin, ravn_origin, consent_origin, *, 
         secret = "simulated-client-" + secrets.token_urlsafe(24)
         private_write(directory / "master.key", base64.b64encode(os.urandom(32)).decode())
         private_write(directory / "oauth.secret", secret)
-    providers = {kind: SimulatedProvider(kind, secret) for kind in ("github", "slack")}
+    providers = {kind: SimulatedProvider(kind, secret) for kind in kinds}
     integrations = []
     for kind, provider in providers.items():
+        connector, _, scopes = kinds[kind]
+        profile = CONNECTORS[connector]
         integrations.append(
             {
                 "id": kind,
                 "app_id": "support-desk",
-                "connector": "slack" if kind == "slack" else "github_cloud",
-                "endpoint": "https://mcp.slack.com/mcp"
-                if kind == "slack"
-                else "https://api.githubcopilot.com/mcp/",
-                "manifest": "builtin:slack-read-v1"
-                if kind == "slack"
-                else "builtin:github-issues-v1",
-                "schema_hashes": {t.name: schema_hash(t) for t in provider.tools},
+                "connector": connector,
+                "endpoint": profile["endpoint"],
+                "manifest": profile["manifest"],
+                # Fixture schemas only; upstream extras such as label writes stay unpinned.
+                "schema_hashes": {
+                    t.name: schema_hash(t)
+                    for t in provider.tools
+                    if t.name in schemas_for(connector)
+                },
                 "oauth": {
                     "client_id": "simulated-" + kind,
                     "client_secret_file": str(directory / "oauth.secret"),
-                    "profile": "slack_user_confidential" if kind == "slack" else "github_app_pkce",
-                    "scopes": [
-                        "search:read.public",
-                        "search:read.private",
-                        "channels:history",
-                        "groups:history",
-                    ]
-                    if kind == "slack"
-                    else [],
+                    "profile": profile["oauth_profile"],
+                    "scopes": scopes,
                 },
             }
         )
@@ -108,8 +116,8 @@ async def simulated_ravn(directory, app_origin, ravn_origin, consent_origin, *, 
     app = broker_app(
         config,
         provider={
-            "github_cloud": GitHub(transport_factory=providers["github"].transport),
-            "slack": Slack(transport_factory=providers["slack"].transport),
+            connector: cls(transport_factory=providers[kind].transport)
+            for kind, (connector, cls, _) in kinds.items()
         },
     )
     service = app.state.service
@@ -148,9 +156,9 @@ async def simulated_ravn(directory, app_origin, ravn_origin, consent_origin, *, 
                     )
                 )
                 access, refresh = bundle["access_token"], bundle.get("refresh_token")
-                if not access.startswith(
-                    "xoxp-simulated-" if kind == "slack" else "ghu_simulated-"
-                ) or (refresh and not refresh.startswith("simulated-refresh-")):
+                if not access.startswith(ACCESS_PREFIX[kind] + "simulated-") or (
+                    refresh and not refresh.startswith("simulated-refresh-")
+                ):
                     raise ValueError("Refusing to simulate a real provider credential")
                 providers[kind].tokens.add(access)
                 if refresh:
@@ -300,7 +308,7 @@ def main():
     mode.add_argument(
         "--demo",
         action="store_true",
-        help="New isolated RAVN, fake GitHub/Slack, no external accounts",
+        help="New isolated RAVN, fake GitHub/Slack/Gmail, no external accounts",
     )
     mode.add_argument(
         "--live", action="store_true", help="Connect this app to your configured RAVN server"

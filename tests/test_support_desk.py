@@ -107,25 +107,37 @@ async def connected(rig, kind="github", reconnect=None):
     )
 
 
-async def run_tool(rig, connection, tool=None, arguments=None):
-    slack = connection["integration_id"] == "slack"
+DEFAULT_READS = {
+    "github": (
+        "issue_read",
+        {"owner": "acme", "repo": "help-center", "issue_number": 42, "method": "get"},
+    ),
+    "slack": ("slack_search_public", {"query": "refund", "limit": 5}),
+    "gmail": ("search_threads", {"query": "refund", "pageSize": 5}),
+}
+DRAFT = {
+    "to": ["dana@example.com"],
+    "subject": "Re: Refund for order #1042 has no confirmation",
+    "body": "Hi Dana, your refund is processing.",
+    "replyToMessageId": "18f2a0c4d5e6f701",
+}
+
+
+async def run_tool(rig, connection, tool=None, arguments=None, key=None):
+    default_tool, default_arguments = DEFAULT_READS[connection["integration_id"]]
     return await rig.browser.post(
         "/api/run",
         headers=rig.headers,
         json={
             "connection_id": connection["id"],
-            "tool": tool or ("slack_search_public" if slack else "issue_read"),
-            "arguments": arguments
-            or (
-                {"query": "refund", "limit": 5}
-                if slack
-                else {"owner": "acme", "repo": "help-center", "issue_number": 42, "method": "get"}
-            ),
+            "tool": tool or default_tool,
+            "arguments": arguments or default_arguments,
+            **({"idempotency_key": key} if key else {}),
         },
     )
 
 
-@pytest.mark.parametrize("kind", ["github", "slack"])
+@pytest.mark.parametrize("kind", ["github", "slack", "gmail"])
 async def test_full_connection_mcp_read_revoke_and_disconnect(desk_rig, kind):
     rig = desk_rig
     conn = await connected(rig, kind)
@@ -134,11 +146,11 @@ async def test_full_connection_mcp_read_revoke_and_disconnect(desk_rig, kind):
     result = first.json()
     assert result["status"] == "succeeded"
     assert "simulated" in result["text"]
-    assert ("1042" if kind == "slack" else "Refund") in result["text"]
+    assert ("Refund" if kind == "github" else "1042") in result["text"]
     assert result["duration_ms"] >= 0
     assert result["call_id"].startswith("call_")
     assert len(result["steps"]) == 4
-    assert rig.providers[kind].calls == ["slack_search_public" if kind == "slack" else "issue_read"]
+    assert rig.providers[kind].calls == [DEFAULT_READS[kind][0]]
     second = await run_tool(rig, conn)
     assert second.json()["session_id"] == result["session_id"]
     state = await rig.browser.get("/api/state")
@@ -322,6 +334,54 @@ async def test_lost_completion_response_is_recovered_read_only(desk_rig):
     assert (await rig.browser.get(target)).status_code == 303
     assert completes == 1
     assert len((await rig.browser.get("/api/state")).json()["connections"]) == 1
+
+
+async def test_gmail_draft_is_saved_once_per_key_and_never_sent(desk_rig):
+    rig = desk_rig
+    gmail = await connected(rig, "gmail")
+    assert gmail["display_name"] == "maya@acme-demo.example"
+    thread = await run_tool(rig, gmail, "get_thread", {"threadId": "18f2a0c4d5e6f701"})
+    assert thread.status_code == 200 and "never got a confirmation" in thread.json()["text"]
+    # The app requires a key for writes, so a browser retry cannot duplicate one.
+    assert (await run_tool(rig, gmail, "create_draft", DRAFT)).status_code == 400
+    first = await run_tool(rig, gmail, "create_draft", DRAFT, key="draft-dana-0001")
+    assert first.status_code == 200, first.text
+    assert first.json()["effect"] == "write"
+    assert "nothing was sent" in first.json()["steps"][-1]
+    again = await run_tool(rig, gmail, "create_draft", DRAFT, key="draft-dana-0001")
+    assert again.status_code == 200, again.text
+    assert again.json()["call_id"] == first.json()["call_id"]
+    assert "nothing new was saved" in again.json()["steps"][-1]
+    assert len(rig.providers["gmail"].drafts) == 1
+    changed = await run_tool(
+        rig, gmail, "create_draft", {**DRAFT, "body": "Different."}, key="draft-dana-0001"
+    )
+    assert changed.status_code == 409 and changed.json()["error"]["code"] == "idempotency_conflict"
+    listed = await run_tool(rig, gmail, "list_drafts", {"pageSize": 5})
+    assert listed.json()["text"].count("r-simulated-") == 1
+    # Google's label writes exist upstream but are neither in the app nor reviewed in RAVN.
+    blocked = await run_tool(rig, gmail, "label_thread", {"threadId": "18f2a0c4d5e6f701"})
+    assert blocked.status_code == 403
+    assert "label_thread" not in rig.providers["gmail"].calls
+    assert "create_draft" in rig.providers["gmail"].calls
+    state = await rig.browser.get("/api/state")
+    for secret in [*rig.providers["gmail"].tokens, *rig.providers["gmail"].refreshes]:
+        assert secret not in state.text + first.text + listed.text
+
+
+async def test_gmail_lost_draft_reply_stays_unknown_and_is_not_resaved(desk_rig):
+    rig = desk_rig
+    gmail = await connected(rig, "gmail")
+    rig.providers["gmail"].lose_response_after_draft = True
+    lost = await run_tool(rig, gmail, "create_draft", DRAFT, key="draft-dana-0002")
+    assert lost.status_code == 502 and lost.json()["error"]["code"] == "outcome_unknown"
+    assert "Check Gmail Drafts" in lost.json()["error"]["message"]
+    rig.providers["gmail"].lose_response_after_draft = False
+    retry = await run_tool(rig, gmail, "create_draft", DRAFT, key="draft-dana-0002")
+    assert retry.status_code == 502 and retry.json()["error"]["code"] == "outcome_unknown"
+    assert len(rig.providers["gmail"].drafts) == 1
+    activity = (await rig.browser.get("/api/state")).json()["activity"]
+    assert activity[0]["status"] == "failed" and activity[0]["call_id"].startswith("call_")
 
 
 async def test_invalid_arguments_and_simulated_not_found(desk_rig):

@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 from urllib.parse import urlencode
 
 from ravn.common import Principal, RavnError, canonical, digest, identifier, now
-from ravn.oauth_provider import OAuthProvider, deadline
+from ravn.oauth_provider import PROFILES, OAuthProvider, deadline
 from ravn.store import event, finish, one
 
 LIVE = ("pending", "authorizing", "exchanging", "awaiting_completion")
@@ -241,11 +241,7 @@ class Onboarding:
                     "OAuth browser binding is invalid or already consumed.",
                 )
             p, integration = await self.live(db, row)
-            if query.get("iss") and query["iss"] != (
-                "https://mcp.slack.com"
-                if integration.connector == "slack"
-                else "https://github.com"
-            ):
+            if query.get("iss") and query["iss"] != PROFILES[integration.oauth.profile]["issuer"]:
                 raise RavnError(400, "invalid_oauth_transaction", "Unexpected OAuth issuer.")
             if "error" in query:
                 await self.terminal(db, p, row, "denied", "authorization_denied")

@@ -252,6 +252,7 @@ class Console:
                     "connection_id",
                     "session_id",
                     "tool",
+                    "effect",
                     "status",
                     "arguments_fingerprint",
                     "fingerprint_key_id",
