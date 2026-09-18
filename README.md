@@ -1,22 +1,48 @@
-# RAVN Python broker — milestones 1–2
+# RAVN Broker
 
 A headless MCP broker built with FastAPI and the official Python MCP SDK. It
 exposes reviewed read tools, plus one reviewed write: Gmail drafts, which are
-never sent. This package is independent of the legacy Rust project and existing demos.
+never sent. Applications keep their own login and UI; RAVN manages provider
+connections, credentials, and short-lived agent access.
 
-**Live GitHub, Slack, and Gmail compatibility remains unverified.** Milestone 0 was
-skipped at the user's request. Tests use local fake identity/OAuth providers and
-real MCP SDK clients/servers, not live accounts. No external writes were made.
+**Live GitHub, Slack, and Gmail compatibility remains unverified.** Tests use
+local fake identity/OAuth providers and real MCP SDK clients/servers, not live accounts.
 
-**New: [GitHub/Slack/Gmail OAuth setup and developer journey](docs/onboarding.md).**
+**[Connect real GitHub, Slack, and Gmail accounts](docs/onboarding.md).**
 Connect from the CLI with `ravn connections connect --integration slack`, or
 use the same REST onboarding flow from your own authenticated backend.
 
 **Try the customer experience: [Support Desk example](examples/support_desk/README.md).**
 A separate FastAPI developer app and end-user UI: connect GitHub/Slack/Gmail, run
-read tools, save Gmail drafts, stop sessions, and disconnect. From `broker/`, run
+read tools, save Gmail drafts, stop sessions, and disconnect. From the repository root, run
 `uv run --locked python -m examples.support_desk --demo` for an isolated RAVN
 with clearly labeled simulated providers, or use `--live` with your configured broker.
+
+## Quick start
+
+Requires Python 3.12+ and [uv](https://docs.astral.sh/uv/). From the repository root:
+
+```sh
+uv sync --locked
+uv run --locked python -m examples.support_desk --demo --console
+```
+
+The launcher opens Support Desk with simulated providers and a local operator
+console. No provider registration is required for this demo. For real accounts,
+follow [OAuth setup](docs/onboarding.md) and the [Support Desk live-mode guide](examples/support_desk/README.md#use-real-accounts-instead).
+
+## Repository layout
+
+| Path | Purpose |
+|---|---|
+| `src/ravn/` | Broker, CLI, provider adapters, migrations, and packaged console |
+| `console/` | Operator console source and build tools |
+| `examples/` | Support Desk and small MCP clients |
+| `tests/` | Python tests with simulated providers |
+| `docs/onboarding.md` | Current provider setup and application integration |
+| `docs/design/` | Broader design targets; some features are not implemented |
+
+See [documentation](docs/README.md) and [repository origin](docs/repository-origin.md).
 
 ## What works
 
@@ -39,7 +65,7 @@ with clearly labeled simulated providers, or use `--live` with your configured b
 
 ## Operator console
 
-From `broker/`, after initialization, use two terminals:
+From the repository root, after initialization, use two terminals:
 
 ```sh
 uv run ravn serve --console
@@ -81,23 +107,21 @@ npm run build
 npm test
 ```
 
-The development sources live in `broker/console/`, separate from the legacy
-Rust/Svelte `console/`. See [console development notes](console/README.md).
+The console development sources live in `console/`. See [console development notes](console/README.md).
 
 Not included: writes other than Gmail drafts, REST tool execution (writes and
 idempotency keys are MCP-only), application-facing activity listing, TypeScript
-helper (milestone 3), or vault adapters.
-The larger [design API](../docs/design/headless-ravn-v1.openapi.yaml) is a target,
+helper, or vault adapters.
+The larger [design API](docs/design/headless-ravn-v1.openapi.yaml) is a target,
 not a claim that all its routes ship here. Unsupported session restrictions fail
-explicitly; do not pass them to this milestone.
+explicitly; do not pass them to this implementation.
 
 ## Install and test
 
-Requires Python 3.12+ and [uv](https://docs.astral.sh/uv/). Tested locally with Python
-3.13.7, FastAPI 0.141.1 and MCP SDK 2.2.0. Exact dependencies are in `uv.lock`.
+Requires Python 3.12+ and [uv](https://docs.astral.sh/uv/). Validated with Python
+3.12.11, FastAPI 0.141.1 and MCP SDK 2.2.0; CI uses Python 3.13. Exact dependencies are in `uv.lock`.
 
 ```sh
-cd broker
 uv sync --locked
 uv run --locked pytest
 uv run --locked ruff format --check src tests examples
@@ -113,7 +137,7 @@ advertised. The SDK owns protocol negotiation; reads are not automatically retri
 The `RAVN broker` GitHub Actions workflow runs the Python tests/style checks,
 checks authored UI formatting, rebuilds the console, checks packaged-asset drift,
 and builds the Python package. Provider tests use isolated local simulators;
-the workflow does not require GitHub or Slack credentials.
+the workflow does not require GitHub, Slack, or Gmail credentials.
 
 ## Connect a real account
 
@@ -177,11 +201,11 @@ These are steps for **you** to run when ready; they have not been run against Gi
    ```
 
 For multi-tenant SaaS, initialize with `--tenant-mode multi` and add `--tenant`
-to backend commands. For OAuth and Slack, follow [onboarding](docs/onboarding.md).
+to backend commands. For OAuth, Slack, and Gmail, follow [onboarding](docs/onboarding.md).
 The backend derives user/tenant from its own verified login.
 RAVN does not authenticate your application's end users for you.
 
-## HTTP surfaces in this milestone
+## Implemented HTTP surfaces
 
 | Surface | Authentication |
 |---|---|
@@ -198,7 +222,7 @@ RAVN does not authenticate your application's end users for you.
 
 ## Deployment limits and recovery
 
-This is a development milestone, not a production-security certification. GitHub/Slack
+This is a development release. Live GitHub/Slack/Gmail
 interoperability, production load testing, backup/restore drills, automatic retention,
 master-key rotation tooling, and a pinned release container remain release work.
 
@@ -229,3 +253,8 @@ master-key rotation tooling, and a pinned release container remain release work.
 
 The Python MCP SDK uses `httpx2`; backend REST examples/CLI use `httpx`. Both are
 explicit locked dependencies. There is no custom implementation of the MCP wire protocol.
+
+## License
+
+[Apache-2.0](LICENSE). Bundled console dependencies retain their
+[third-party notices](console/public/THIRD_PARTY_NOTICES.txt).

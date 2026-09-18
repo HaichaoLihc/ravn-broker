@@ -23,7 +23,7 @@ npm test
 ```
 
 The build writes packaged assets to `../src/ravn/static/console/`. Run
-`uv run ravn serve --console` and `uv run ravn console` from the broker directory.
+`uv run ravn serve --console` and `uv run ravn console` from the repository root.
 Serve the built UI with FastAPI; a standalone Vite origin is not authorized for
 operator API requests. No CORS relaxation is provided for development.
 

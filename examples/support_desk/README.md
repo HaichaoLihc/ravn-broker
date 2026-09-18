@@ -7,7 +7,7 @@ never sent); it does not generate answers or autonomously choose actions.
 
 ## Try it immediately
 
-From `broker/`:
+From the repository root:
 
 ```sh
 uv sync --locked
@@ -67,12 +67,11 @@ The isolated demo starts these loopback listeners:
 | 18883 | Clearly labeled simulated OAuth consent pages |
 
 `--port N` moves them to N, N+1, N+3. Occupied ports fail startup; existing RAVN
-servers/data are not replaced. The existing 18787/18788 broker/console is untouched.
+servers/data are not replaced. The demo uses its own temporary state and separate ports.
 Add `--console` to run the demo's operator console on port N+2. It uses the
 **same service and database** as the demo gateway, so connections, sessions and
 calls appear there. It is not `/console/` on the gateway's port. Console and
-customer logins remain separate, and its cookie does not replace the original
-18788 console's login.
+customer logins remain separate, and its cookie does not replace another broker console's login.
 
 ```sh
 uv run --locked python -m examples.support_desk --demo --console
@@ -124,7 +123,7 @@ It does not read RAVN's database, master key, or admin socket.
 
    ```sh
    uv run --locked python -m examples.support_desk --live \
-     --ravn-url http://127.0.0.1:18787 \
+     --ravn-url http://127.0.0.1:8787 \
      --app-key-file /absolute/path/support-desk.key \
      --app-id demo --user-id you
    ```
@@ -203,14 +202,14 @@ Files:
 
 ## Verify
 
-From `broker/`:
+From the repository root:
 
 ```sh
 uv run --locked python -m pytest tests/test_support_desk.py
 uv run --locked ruff check examples/support_desk tests/test_support_desk.py
 ```
 
-Tests exercise both providers through the real RAVN OAuth and MCP stack,
+Tests exercise all three providers through the real RAVN OAuth and MCP stack,
 cancellation, callback/login replay protection, CSRF, actor isolation, credential
 non-disclosure, reconnect, session revocation, disconnect, write-tool enforcement,
 single-save drafts per idempotency key, uncertain draft outcomes,

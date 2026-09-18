@@ -3,6 +3,8 @@ name = "ravn-broker"
 version = "0.1.0.dev0"
 description = "RAVN headless MCP connection broker"
 readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 requires-python = ">=3.12"
 dependencies = [
     "aiosqlite>=0.21,<1",
@@ -31,7 +33,7 @@ build-backend = "hatchling.build"
 packages = ["src/ravn"]
 
 [tool.hatch.build.targets.sdist]
-include = ["src/ravn", "examples", "tests", "docs", "console", "README.md", "pyproject.toml", "uv.lock", ".gitignore"]
+include = ["src/ravn", "examples", "tests", "docs", "console", "README.md", "LICENSE", "pyproject.toml", "uv.lock", ".gitignore"]
 exclude = [
     "**/node_modules/**",
     "**/__pycache__/**",

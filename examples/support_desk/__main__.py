@@ -1,4 +1,4 @@
-"""Run from broker/: python -m examples.support_desk --demo (or --live)."""
+"""Run from the repository root: python -m examples.support_desk --demo (or --live)."""
 
 import argparse
 import asyncio

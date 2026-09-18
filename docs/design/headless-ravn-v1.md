@@ -1,10 +1,10 @@
 # RAVN: Minimal Technical Design
 
-Status: milestones 1–2 implemented locally; live-provider acceptance still open\
+Status: design target; see the root README for implemented features\
 Date: 2026-09-11\
 Revision: FastAPI, optional idempotency, and practical MCP access
 
-**Implementation update:** The Python broker lives in [broker/](../../broker/README.md). Milestone 0 was skipped at the user's request; live GitHub/Slack/Gmail compatibility remains unverified. A Gmail connector (Google's hosted Gmail MCP server) adds the first reviewed write, `create_draft`, over MCP with optional idempotency keys, no automatic retry, and `outcome_unknown` for ambiguous results. Milestone 2 now adds GitHub App user OAuth, Slack user OAuth and remote MCP reads, browser-bound completion, single-flight refresh, same-account reconnect, CLI onboarding, and a small Python browser-login binding helper. An optional operator console reuses the supplied HTML. Writes, REST execution, application-facing activity listing, and the broader milestone-3 helper remain future work. See the [onboarding guide](../../broker/docs/onboarding.md) for the implemented contract and provider setup.
+**Implementation update:** The Python broker lives in [this repository](../../README.md). Live GitHub/Slack/Gmail compatibility remains unverified. A Gmail connector (Google's hosted Gmail MCP server) adds the first reviewed write, `create_draft`, over MCP with optional idempotency keys, no automatic retry, and `outcome_unknown` for ambiguous results. Milestone 2 now adds GitHub App user OAuth, Slack user OAuth and remote MCP reads, browser-bound completion, single-flight refresh, same-account reconnect, CLI onboarding, and a small Python browser-login binding helper. An optional operator console reuses the supplied HTML. Writes other than Gmail drafts, REST execution, application-facing activity listing, and the broader milestone-3 helper remain future work. See the [onboarding guide](../onboarding.md) for the implemented contract and provider setup.
 
 ## 1. What we are building
 
@@ -149,4 +149,4 @@ Later: finer tool/repository restrictions, service-owned connections, external v
 
 **First experience: authorize an account once, configure MCP access, then let the agent call tools.**
 
-Further detail: [implementation reference](headless-ravn-v1-reference.md) and [OpenAPI contract](headless-ravn-v1.openapi.yaml). These describe the full design target; [the broker README](../../broker/README.md) identifies the implemented subset and its limitations.
+Further detail: [implementation reference](headless-ravn-v1-reference.md) and [OpenAPI contract](headless-ravn-v1.openapi.yaml). These describe the full design target; [the broker README](../../README.md) identifies the implemented subset and its limitations.

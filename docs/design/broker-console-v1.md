@@ -1,8 +1,8 @@
 # RAVN broker console — proposed design
 
 Date: 2026-09-11\
-Status: minimal local implementation available; see [broker console](../../broker/console/README.md)\
-Baseline: [implemented milestones 1–2](../../broker/README.md)
+Status: minimal local implementation available; see [broker console](../../console/README.md)\
+Baseline: [implemented milestones 1–2](../../README.md)
 
 Implementation update: the optional loopback console now reuses the supplied HTML's actual components, tokens, fonts and icons. No Sites project or deployment is involved. Core operator queries, local login, revocation, disconnect, activity, read-only settings and a bounded connection access map are implemented. The UI uses a fixed 24-hour activity window; broader API time filters and deployment-level events are not separate UI controls yet. This document remains the fuller design reference, not a production-readiness claim.
 
@@ -125,7 +125,7 @@ Add indexes for app-scoped call/event chronology and the supported session/conne
 
 ## 6. Frontend integration and build order
 
-Proposed source location: `broker/console/`, independent of the legacy Svelte/Rust `console/`. Use React + TypeScript with a build-time bundler to reuse the supplied React components directly; rewriting them to Svelte would not help this task. Extract reusable authored components and tokens, replace `window.RavnData` and toast-only mock actions with a typed API client, and preserve/review third-party asset licenses.
+Source location: `console/` in this standalone repository. Use React + TypeScript with a build-time bundler to reuse the supplied React components directly; rewriting them to Svelte would not help this task. Extract reusable authored components and tokens, replace `window.RavnData` and toast-only mock actions with a typed API client, and preserve/review third-party asset licenses.
 
 Do not ship the HTML artifact wrapper, browser Babel compiler, React development bundles, design-tweak panel, external CDN scripts, mock “prod” accounts or unimplemented buttons. Bundle assets locally into the Python package; production users need no Node server. Preserve keyboard focus, accessible drawers/modals, status text alongside color, and narrow-screen table scrolling. Render metadata as text, never provider HTML. Restrict scripts/connections to the console origin and forbid framing, plugins and base-tag overrides; do not enable `unsafe-eval` to preserve the mockup's runtime Babel behavior.
 

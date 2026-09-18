@@ -1,6 +1,6 @@
 # Connect GitHub, Slack, or Gmail
 
-Milestone 2 is implemented and tested locally. **Live provider compatibility is
+OAuth onboarding is implemented and tested locally. **Live provider compatibility is
 still unverified.** You register your own provider app; users authorize it. No
 provider app, workspace, account, or credential is created by installing RAVN.
 
@@ -9,7 +9,7 @@ schemas → give an ordinary MCP client a connection-bound RAVN session.
 
 ## 1. Common setup
 
-Work in `broker/`. Run `uv sync --locked`. For new deployments only, initialize
+Work in the repository root. Run `uv sync --locked`. For new deployments only, initialize
 with `uv run ravn init --directory .ravn --app demo`. Do not reinitialize existing
 state. Add a return URL to the existing application in `.ravn/ravn.yaml`:
 

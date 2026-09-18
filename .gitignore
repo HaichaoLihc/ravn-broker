@@ -16,3 +16,13 @@ __pycache__/
 *.egg-info/
 dist/
 .env*
+
+# Private credentials and local build/editor state.
+*.key
+*.pem
+*.sqlite-*
+*.sqlite3-*
+.DS_Store
+.coverage
+htmlcov/
+build/
