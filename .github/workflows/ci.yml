@@ -29,8 +29,8 @@ jobs:
           uv sync --locked
       - name: Check Python style and tests
         run: |
-          uv run --locked ruff format --check src tests examples
-          uv run --locked ruff check src tests examples
+          uv run --locked ruff format --check src tests
+          uv run --locked ruff check src tests
           uv run --locked pytest
       - name: Check and build the UI
         working-directory: console

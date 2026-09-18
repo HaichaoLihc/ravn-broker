@@ -314,7 +314,7 @@ async def run(args):
 
 
 def parser():
-    root = argparse.ArgumentParser(description="RAVN: OAuth connections and read-only MCP access")
+    root = argparse.ArgumentParser(description="RAVN: OAuth connections and controlled MCP access")
     sub = root.add_subparsers(dest="command", required=True)
     init = sub.add_parser(
         "init", help="Create owner-only local development state; refuses overwrite"
