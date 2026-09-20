@@ -3,6 +3,8 @@
 import asyncio
 import base64
 import json
+from contextlib import asynccontextmanager
+from urllib.parse import parse_qs, urlsplit
 
 import httpx
 import httpx2
@@ -15,6 +17,7 @@ from mcp.shared.exceptions import MCPError
 
 from ravn.app import create_app
 from ravn.config import Config
+from ravn.console import PREFIX, Console, create_console_app
 from ravn.github import GitHub
 from ravn.gmail import Gmail
 from ravn.manifest import GMAIL_SCHEMAS, schema_hash
@@ -275,3 +278,88 @@ async def test_unreviewed_writes_and_rich_fields_never_reach_gmail(gmail, name, 
         data = await refused(mcp, name=name, arguments=arguments)
     assert data["code"] == code
     assert gmail.fake.calls == []
+
+
+@asynccontextmanager
+async def operator(service):
+    """A console client for this deployment, as the Permissions tab is."""
+    state = Console(service)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_console_app(state)), base_url=state.origin
+    ) as http:
+        ticket = parse_qs(urlsplit(state.ticket()["url"]).fragment)["ticket"][0]
+        response = await http.post(
+            PREFIX + "/auth/exchange", headers={"Origin": state.origin}, json={"ticket": ticket}
+        )
+        http.headers.update({"Origin": state.origin, "X-CSRF-Token": response.json()["csrf_token"]})
+        yield http
+    state.close()
+
+
+async def set_draft(http, session_id, allowed):
+    response = await http.put(
+        PREFIX + f"/sessions/{session_id}/permissions",
+        json={"app_id": "demo", "tenant_id": "default", "tools": {"create_draft": allowed}},
+    )
+    assert response.status_code == 200, response.text
+    return {p["name"]: p["allowed"] for p in response.json()["permissions"]}
+
+
+async def test_a_write_survives_being_denied_and_allowed_again(gmail):
+    """Re-allowing a write tool restores it; a denial leaves nothing stuck behind."""
+    async with operator(gmail.service) as http:
+        sid = gmail.runtime["id"]
+        async with gmail.mcp(gmail.runtime) as mcp:
+            await draft(mcp)
+        assert len(gmail.fake.calls) == 1
+
+        assert (await set_draft(http, sid, False))["create_draft"] is False
+        async with gmail.mcp(gmail.runtime) as mcp:
+            assert (await refused(mcp))["code"] == "permission_denied"
+        assert len(gmail.fake.calls) == 1, "a denied write still reached Gmail"
+
+        assert (await set_draft(http, sid, True))["create_draft"] is True
+        async with gmail.mcp(gmail.runtime) as mcp:
+            assert "create_draft" in {t.name for t in (await mcp.list_tools()).tools}
+            await draft(mcp)
+        assert len(gmail.fake.calls) == 2, "the write did not recover after being re-allowed"
+
+
+async def test_the_cycle_holds_on_one_long_lived_connection(gmail):
+    """An agent keeps one MCP session open across an operator's changes."""
+    async with operator(gmail.service) as http:
+        sid = gmail.runtime["id"]
+        async with gmail.mcp(gmail.runtime) as mcp:
+            await draft(mcp)
+            await set_draft(http, sid, False)
+            assert (await refused(mcp))["code"] == "permission_denied"
+            await set_draft(http, sid, True)
+            await draft(mcp)
+    assert len(gmail.fake.calls) == 2
+
+
+async def test_repeated_toggling_settles_on_the_last_decision(gmail):
+    async with operator(gmail.service) as http:
+        sid = gmail.runtime["id"]
+        for allowed in (False, True, False, True, False):
+            await set_draft(http, sid, allowed)
+        async with gmail.mcp(gmail.runtime) as mcp:
+            assert (await refused(mcp))["code"] == "permission_denied"
+        assert (await set_draft(http, sid, True))["create_draft"] is True
+        async with gmail.mcp(gmail.runtime) as mcp:
+            await draft(mcp)
+    assert len(gmail.fake.calls) == 1
+
+
+async def test_a_denied_write_does_not_consume_its_idempotency_key(gmail):
+    """Otherwise a refusal would poison the key and block the retry after re-allowing."""
+    async with operator(gmail.service) as http:
+        sid = gmail.runtime["id"]
+        await set_draft(http, sid, False)
+        async with gmail.mcp(gmail.runtime) as mcp:
+            assert (await refused(mcp, key="draft-77"))["code"] == "permission_denied"
+        await set_draft(http, sid, True)
+        async with gmail.mcp(gmail.runtime) as mcp:
+            result = await draft(mcp, key="draft-77")
+    assert gmail.fake.calls == [("create_draft", DRAFT)]
+    assert result.meta.get("ravn/idempotency-replayed") is not True

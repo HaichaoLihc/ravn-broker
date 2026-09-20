@@ -188,6 +188,9 @@ function Detail({
 }) {
   const [row, setRow] = useState(selection.row);
   const [busy, setBusy] = useState('');
+  // A ref, not the state above: two clicks in one tick both read the old state.
+  const toggling = useRef(false);
+  const [refresh, setRefresh] = useState(0);
   const [error, setError] = useState('');
   const [loaded, setLoaded] = useState(false);
   const [related, setRelated] = useState<Row[]>([]);
@@ -217,7 +220,7 @@ function Detail({
         if (e.name !== 'AbortError') setError(e.message);
       });
     return () => abort.abort();
-  }, [selection]);
+  }, [selection, refresh]);
   useEffect(() => {
     if (!map) return;
     const abort = new AbortController();
@@ -418,11 +421,19 @@ function Detail({
                           : 'Read only.'
                       }
                       onChange={async (next: boolean) => {
-                        if (busy) return;
+                        if (toggling.current) return;
+                        toggling.current = true;
                         setBusy(permission.name);
-                        const updated = await onPermission(row, permission.name, next);
-                        if (updated) setRow((old) => ({ ...old, permissions: updated }));
-                        setBusy('');
+                        try {
+                          const updated = await onPermission(row, permission.name, next);
+                          if (updated) setRow((old) => ({ ...old, permissions: updated }));
+                        } finally {
+                          toggling.current = false;
+                          setBusy('');
+                          // Re-read the row: a change also moves current_tools and
+                          // blocked_reason, which the response above does not carry.
+                          setRefresh((v) => v + 1);
+                        }
                       }}
                     />
                   ))}
