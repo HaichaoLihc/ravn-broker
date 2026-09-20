@@ -1,6 +1,7 @@
 import asyncio
 import base64
 from contextlib import asynccontextmanager
+from urllib.parse import parse_qs, urlsplit
 
 import httpx
 import httpx2
@@ -12,6 +13,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 
 from ravn.app import create_app
 from ravn.config import Config
+from ravn.console import PREFIX, Console, create_console_app
 from ravn.github import GitHub
 from ravn.manifest import SCHEMAS, schema_hash
 
@@ -172,3 +174,19 @@ async def rig(config):
             transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1:8787"
         ) as http:
             yield Rig(app, http, fake, key, saas_key)
+
+
+@pytest.fixture
+async def console(rig):
+    state = Console(rig.service)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_console_app(state)), base_url=state.origin
+    ) as http:
+        ticket = parse_qs(urlsplit(state.ticket()["url"]).fragment)["ticket"][0]
+        response = await http.post(
+            PREFIX + "/auth/exchange", headers={"Origin": state.origin}, json={"ticket": ticket}
+        )
+        assert response.status_code == 200, response.text
+        http.headers.update({"Origin": state.origin, "X-CSRF-Token": response.json()["csrf_token"]})
+        yield state, http
+    state.close()

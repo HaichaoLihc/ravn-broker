@@ -260,6 +260,19 @@ button:disabled {
   font-size: 13px;
   overflow-wrap: anywhere;
 }
+.permission-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 8px 0;
+}
+.permission-list > * {
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border-hairline);
+}
+.permission-list > *:last-child {
+  border-bottom: none;
+}
 .button-row {
   display: flex;
   gap: 8px;

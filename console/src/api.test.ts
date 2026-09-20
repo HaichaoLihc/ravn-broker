@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, afterEach } from 'vitest';
-import { api, ApiError, date, query, rowKey, setCsrf } from './api';
+import { api, ApiError, date, permissionBody, permissionsOf, query, rowKey, setCsrf } from './api';
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -53,5 +53,33 @@ describe('console API client', () => {
   it('does not display invalid timestamps', () => {
     expect(date(null)).toBe('—');
     expect(date('not a date')).toBe('—');
+  });
+});
+describe('session permissions', () => {
+  const row = {
+    id: 'sess_1',
+    app_id: 'demo',
+    tenant_id: 'default',
+    permissions: [
+      { name: 'issue_read', allowed: true, effect: 'read' },
+      { name: 'list_issues', allowed: false, effect: 'read' },
+    ],
+  };
+  it('sends one tool per change, inside the row namespace', () => {
+    expect(permissionBody(row, 'list_issues', true)).toEqual({
+      app_id: 'demo',
+      tenant_id: 'default',
+      tools: { list_issues: true },
+    });
+  });
+  it('reads decisions from a detail row and tolerates an older payload', () => {
+    expect(permissionsOf(row).map((p) => p.allowed)).toEqual([true, false]);
+    expect(permissionsOf({ id: 'sess_2' })).toEqual([]);
+    expect(permissionsOf({ id: 'sess_3', permissions: null })).toEqual([]);
+  });
+  it('never infers a namespace the row does not carry', () => {
+    const body = permissionBody({ id: 'sess_4' }, 'issue_read', false);
+    expect(body.app_id).toBe('');
+    expect(body.tenant_id).toBe('');
   });
 });

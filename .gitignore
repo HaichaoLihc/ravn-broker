@@ -4,7 +4,11 @@
 __pycache__/
 *.pyc
 .probe/
+# Any deployment or harness state directory, not just the default name.
 .ravn/
+.ravn*/
+# A runtime session token is a live credential.
+session.json
 # Runtime state and one-use login links are never source files.
 *.db
 *.db-*

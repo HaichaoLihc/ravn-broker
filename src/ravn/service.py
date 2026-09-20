@@ -20,6 +20,7 @@ from ravn.github import GitHub
 from ravn.gmail import Gmail
 from ravn.manifest import check_schema, is_write, schema_hash, schemas_for, validate_arguments
 from ravn.oauth import Onboarding
+from ravn.permissions import effective_tools, session_rules
 from ravn.slack import Slack
 from ravn.store import Store, event, finish, one, rows
 
@@ -231,6 +232,17 @@ class Service:
                     raise RavnError(
                         403, "permission_denied", "Tool is outside this session's ceiling."
                     )
+                # Read at call time, so an operator's change reaches a live session.
+                try:
+                    rules = await session_rules(db, p.app, p.tenant, p.session_id)
+                except Exception:
+                    raise RavnError(
+                        403, "permission_denied", "Tool permissions are unavailable."
+                    ) from None
+                if tool not in effective_tools(ceiling, integration, rules):
+                    raise RavnError(
+                        403, "permission_denied", "Tool is denied by this session's permissions."
+                    )
         return conn, integration
 
     async def credential(self, p: Principal, connection_id: str):
@@ -303,12 +315,9 @@ class Service:
                         (p.app, p.tenant, p.session_id),
                     )
                     ceiling = json.loads(session["tools"])
-                    tools = [
-                        t
-                        for t in tools
-                        if t.name in ceiling
-                        and ceiling[t.name] == integration.schema_hashes.get(t.name)
-                    ]
+                    rules = await session_rules(db, p.app, p.tenant, p.session_id)
+                    allowed = set(effective_tools(ceiling, integration, rules))
+                    tools = [t for t in tools if t.name in allowed]
             return tools
 
     async def inspect_connection(self, p, cid):

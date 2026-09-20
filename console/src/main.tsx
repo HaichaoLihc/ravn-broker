@@ -3,7 +3,21 @@ import { createRoot } from 'react-dom/client';
 import originalComponents from './reference/components.js';
 import './reference/tokens.css';
 import './console.css';
-import { api, ApiError, Bootstrap, date, Page, query, Row, rowKey, setCsrf, text } from './api';
+import {
+  api,
+  ApiError,
+  Bootstrap,
+  date,
+  Page,
+  Permission,
+  permissionBody,
+  permissionsOf,
+  query,
+  Row,
+  rowKey,
+  setCsrf,
+  text,
+} from './api';
 
 // These are the actual primitives extracted from the user's Ravn Console.html.
 const {
@@ -18,15 +32,17 @@ const {
   EmptyState,
   AgentGraph,
   DataValue,
+  Switch,
 } = originalComponents as unknown as Record<string, React.ComponentType<any>>;
 
-type View = 'connections' | 'sessions' | 'activity' | 'settings';
+type View = 'connections' | 'sessions' | 'permissions' | 'activity' | 'settings';
 type Selection = { kind: string; row: Row };
 const NAV = [
   {
     items: [
       { id: 'connections', label: 'Connections', icon: 'database' },
       { id: 'sessions', label: 'Sessions', icon: 'key-round' },
+      { id: 'permissions', label: 'Permissions', icon: 'shield' },
       { id: 'activity', label: 'Activity', icon: 'activity' },
     ],
   },
@@ -35,12 +51,14 @@ const NAV = [
 const TITLES: Record<View, string> = {
   connections: 'Connections',
   sessions: 'Sessions',
+  permissions: 'Permissions',
   activity: 'Activity',
   settings: 'Settings',
 };
 const ICONS: Record<View, string> = {
   connections: 'database',
   sessions: 'key-round',
+  permissions: 'shield',
   activity: 'activity',
   settings: 'settings',
 };
@@ -159,14 +177,17 @@ function Detail({
   onAct,
   onSessions,
   onCalls,
+  onPermission,
 }: {
   selection: Selection;
   onClose: () => void;
   onAct: (s: Selection) => void;
   onSessions: (id: string) => void;
   onCalls: (field: string, id: string) => void;
+  onPermission: (row: Row, name: string, allowed: boolean) => Promise<Permission[] | null>;
 }) {
   const [row, setRow] = useState(selection.row);
+  const [busy, setBusy] = useState('');
   const [error, setError] = useState('');
   const [loaded, setLoaded] = useState(false);
   const [related, setRelated] = useState<Row[]>([]);
@@ -382,27 +403,43 @@ function Detail({
                   ['Revoked', date(row.revoked_at)],
                 ]}
               />
-              <h2>Allowed by RAVN now</h2>
-              <div className="tool-list">
-                {Array.isArray(row.current_tools) && row.current_tools.length ? (
-                  row.current_tools.map((tool: string) => (
-                    <code key={tool}>
-                      {tool}
-                      {tool === 'issue_read'
-                        ? ' · method=get'
-                        : tool === 'list_issues'
-                          ? ' · owner/repo only'
-                          : ' · read only'}
-                    </code>
-                  ))
-                ) : (
-                  <p className="muted">No executable tools.</p>
-                )}
-              </div>
+              <h2>Tools this session may call</h2>
+              {permissionsOf(row).length ? (
+                <div className="permission-list">
+                  {permissionsOf(row).map((permission: Permission) => (
+                    <Switch
+                      key={permission.name}
+                      checked={permission.allowed}
+                      disabled={busy !== '' || row.status !== 'active'}
+                      label={permission.name}
+                      hint={
+                        permission.effect === 'write'
+                          ? 'Changes the provider. Never retried.'
+                          : 'Read only.'
+                      }
+                      onChange={async (next: boolean) => {
+                        if (busy) return;
+                        setBusy(permission.name);
+                        const updated = await onPermission(row, permission.name, next);
+                        if (updated) setRow((old) => ({ ...old, permissions: updated }));
+                        setBusy('');
+                      }}
+                    />
+                  ))}
+                </div>
+              ) : (
+                <p className="muted">
+                  No reviewed tools remain for this session. Pin schemas for the integration and
+                  issue a new session.
+                </p>
+              )}
               <p className="muted">
-                The session ceiling is {Array.isArray(row.tools) ? row.tools.join(', ') : 'empty'}.
-                The provider's own account and token permissions apply independently. They are not
-                enumerated here.
+                {row.status === 'active'
+                  ? 'A change takes effect on the next call, including for an agent already running. Turning a tool off never ends the session.'
+                  : 'This session is no longer usable, so these settings do not grant anything.'}{' '}
+                The session ceiling is {Array.isArray(row.tools) ? row.tools.join(', ') : 'empty'};
+                nothing outside it can be granted here. The provider's own account and token
+                permissions apply independently and are not enumerated.
               </p>
               <Button variant="secondary" onClick={() => onCalls('session_id', row.id)}>
                 View calls
@@ -524,7 +561,10 @@ function ConsoleApp() {
         ? settings === 'keys'
           ? 'app-keys'
           : ''
-        : view;
+        : // Permissions are granted per session, so it reads the same records.
+          view === 'permissions'
+          ? 'sessions'
+          : view;
   const params = useMemo(
     () => ({
       app_id: app,
@@ -681,6 +721,28 @@ function ConsoleApp() {
       busyRef.current = false;
     }
   }
+  async function changePermission(row: Row, name: string, allowed: boolean) {
+    try {
+      const result = await api<{ permissions: Permission[] }>(
+        `/sessions/${encodeURIComponent(row.id)}/permissions`,
+        { method: 'PUT', body: JSON.stringify(permissionBody(row, name, allowed)) },
+      );
+      setToast(
+        allowed
+          ? `${name} is allowed for this session.`
+          : `${name} is denied. The next call is refused.`,
+      );
+      setToastError(false);
+      setReload((v) => v + 1);
+      return result.permissions;
+    } catch (e) {
+      handleError(e as Error);
+      setReload((v) => v + 1);
+      setToast('Could not change this permission. Refresh and check the session before retrying.');
+      setToastError(true);
+      return null;
+    }
+  }
   const open = (row: Row) => setSelection({ kind: resource, row });
   const identityColumn = {
     key: 'identity',
@@ -747,6 +809,20 @@ function ConsoleApp() {
             key: 'broker_access',
             label: 'Broker access',
             render: (r: Row) => <State value={r.broker_access} />,
+          },
+        ]
+      : []),
+    ...(view === 'permissions'
+      ? [
+          {
+            key: 'permissions',
+            label: 'Tools allowed',
+            render: (r: Row) => {
+              const items = permissionsOf(r);
+              if (!items.length) return 'None';
+              const allowed = items.filter((p) => p.allowed).length;
+              return `${allowed} of ${items.length}`;
+            },
           },
         ]
       : []),
@@ -872,9 +948,11 @@ function ConsoleApp() {
                   ? 'User accounts available through RAVN.'
                   : view === 'sessions'
                     ? 'Short-lived access to one connection per session.'
-                    : view === 'activity'
-                      ? 'Recorded calls and management events. No arguments or results.'
-                      : 'Operator-owned configuration. Changes remain in the CLI and config file.'}
+                    : view === 'permissions'
+                      ? 'Choose the tools each session may call. Changes apply to the running agent at its next call.'
+                      : view === 'activity'
+                        ? 'Recorded calls and management events. No arguments or results.'
+                        : 'Operator-owned configuration. Changes remain in the CLI and config file.'}
               </p>
             </div>
             <Button
@@ -1023,7 +1101,11 @@ function ConsoleApp() {
                           <span className="muted">Personal-token import is also available.</span>
                         </>
                       ) : resource === 'sessions' ? (
-                        'Create a session from your trusted backend or CLI after connecting an account.'
+                        view === 'permissions' ? (
+                          'Permissions are granted per session. Create one, then choose its tools here.'
+                        ) : (
+                          'Create a session from your trusted backend or CLI after connecting an account.'
+                        )
                       ) : resource === 'app-keys' ? (
                         <code className="command">
                           ravn app-key create --app {app} --output /private/path/backend.key
@@ -1112,7 +1194,11 @@ function ConsoleApp() {
                       ['Console access', 'Loopback · local owner only'],
                       ['Provider compatibility', 'Live verification not performed'],
                       ['OAuth / refresh', 'Implemented · configure provider apps'],
-                      ['Write tools', 'Not enabled'],
+                      ['Write tools', boot.features.writes ? 'Reviewed and pinned' : 'None pinned'],
+                      [
+                        'Session permissions',
+                        boot.features.session_permissions ? 'Editable here' : 'Not available',
+                      ],
                     ]}
                   />
                   <p className="muted">
@@ -1133,6 +1219,7 @@ function ConsoleApp() {
               }}
               onSessions={(id) => linked('connection_id', id, 'sessions')}
               onCalls={(field, id) => linked(field, id, 'activity')}
+              onPermission={changePermission}
             />
           )}
           {confirm && (

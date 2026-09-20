@@ -1,5 +1,7 @@
 export type Row = { id: string; [key: string]: unknown };
 export type Page = { data: Row[]; next_cursor: string | null; as_of: string };
+/** One tool a session may be granted, with the operator's present decision. */
+export type Permission = { name: string; allowed: boolean; effect: 'read' | 'write' };
 export type Bootstrap = {
   deployment_id: string;
   version: string;
@@ -21,9 +23,29 @@ export type Bootstrap = {
     oauth_profile: string | null;
     callback_url: string | null;
     reviewed_tools: string[];
+    tools: { name: string; effect: 'read' | 'write' }[];
     schema_hashes: Record<string, string>;
   }[];
+  features: {
+    oauth: boolean;
+    writes: boolean;
+    scope_editing: boolean;
+    session_permissions: boolean;
+    live_provider_verified: boolean;
+  };
 };
+/** Reads the permission rows a session detail carries, tolerating an older payload. */
+export function permissionsOf(row: Row): Permission[] {
+  return Array.isArray(row.permissions) ? (row.permissions as Permission[]) : [];
+}
+/** The request body for one toggle: the server accepts only ceiling names. */
+export function permissionBody(row: Row, name: string, allowed: boolean) {
+  return {
+    app_id: String(row.app_id ?? ''),
+    tenant_id: String(row.tenant_id ?? ''),
+    tools: { [name]: allowed },
+  };
+}
 let csrf = '';
 export function setCsrf(value: string) {
   csrf = value;
