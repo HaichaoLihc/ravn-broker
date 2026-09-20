@@ -3,7 +3,7 @@ import sqlite3
 import time
 from dataclasses import replace
 from importlib.resources import files
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import urlsplit
 
 import httpx
 import pytest
@@ -39,7 +39,7 @@ async def test_schema_one_migration_preserves_history(config):
     await service.start()
     try:
         async with service.store.transaction() as db:
-            assert (await one(db, "PRAGMA user_version"))["user_version"] == 4
+            assert (await one(db, "PRAGMA user_version"))["user_version"] == 5
             row = await one(db, "SELECT * FROM events WHERE id='evt_legacy'")
             assert row["user_id"] == "alice" and row["actor_kind"] is None
             plan = await one(
@@ -50,22 +50,6 @@ async def test_schema_one_migration_preserves_history(config):
             assert "events_app_time" in plan["detail"]
     finally:
         await service.close()
-
-
-@pytest.fixture
-async def console(rig):
-    state = Console(rig.service)
-    async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=create_console_app(state)), base_url=state.origin
-    ) as http:
-        ticket = parse_qs(urlsplit(state.ticket()["url"]).fragment)["ticket"][0]
-        response = await http.post(
-            PREFIX + "/auth/exchange", headers={"Origin": state.origin}, json={"ticket": ticket}
-        )
-        assert response.status_code == 200, response.text
-        http.headers.update({"Origin": state.origin, "X-CSRF-Token": response.json()["csrf_token"]})
-        yield state, http
-    state.close()
 
 
 async def test_local_auth_ticket_single_use_expiry_and_cookie(rig):

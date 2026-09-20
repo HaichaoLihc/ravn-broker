@@ -52,6 +52,14 @@ async def revoke_session(db, p, session, **audit):
     await event(db, p, "session.revoked", session["id"], **audit)
 
 
+async def set_permissions(db, p, session, decisions: dict, **audit):
+    """Narrow a live session's tools. Never widens it beyond its stored ceiling."""
+    from ravn.permissions import set_session_rules
+
+    await set_session_rules(db, p.app, p.tenant, session["id"], decisions)
+    await event(db, p, "session.permissions_updated", session["id"], **audit)
+
+
 async def revoke_key(db, p, key, revoke_sessions, **audit):
     await db.execute(
         "UPDATE app_keys SET revoked_at=COALESCE(revoked_at,?) WHERE id=?", (now(), key["id"])
