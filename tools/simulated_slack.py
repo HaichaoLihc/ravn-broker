@@ -19,11 +19,13 @@ from pathlib import Path
 import httpx
 import httpx2
 import uvicorn
+import yaml
 from mcp import types
 from mcp.server import Server
 from mcp.server.transport_security import TransportSecuritySettings
 
-from ravn.app import create_app
+from ravn.app import create_admin_app, create_app
+from ravn.cli import AdminServer
 from ravn.config import Config
 from ravn.console import Console, create_console_app
 from ravn.github import GitHub
@@ -146,7 +148,11 @@ def prepare(argv) -> tuple[Path, FakeSlack, Config]:
     root.mkdir(mode=0o700, parents=True)
     (root / "run").mkdir(mode=0o700)
     fake = FakeSlack()
-    return root, fake, build_config(root, fake)
+    config = build_config(root, fake)
+    # Written so `ravn console --config` can reach this process's admin socket.
+    (root / "ravn.yaml").write_text(yaml.safe_dump(config.model_dump(mode="json"), sort_keys=False))
+    (root / "ravn.yaml").chmod(0o600)
+    return root, fake, config
 
 
 async def main(root: Path, fake: FakeSlack, config: Config) -> int:
@@ -185,6 +191,8 @@ async def main(root: Path, fake: FakeSlack, config: Config) -> int:
         print(f"  Session token  {runtime['token']}")
         print(f"  Also written   {root / 'session.json'} (0600)")
         print(f"  Console        {console.ticket()['url']}")
+        print("\n  A sign-in link is single use. For another:")
+        print(f"    uv run ravn console --config {root / 'ravn.yaml'}")
         print("\n  Open the console, choose Permissions, and toggle a tool.")
         print("  The running agent is refused at its next call.\n")
 
@@ -210,6 +218,24 @@ async def main(root: Path, fake: FakeSlack, config: Config) -> int:
                 )
             ),
         ]
+        # The same owner-only socket the real server exposes, so `ravn console` can
+        # mint a fresh sign-in link. A unix socket path has a hard length limit, so
+        # a deep directory costs the extra links, not the run.
+        socket = str(config.server.admin_socket)
+        if len(socket.encode()) < 100:
+            servers.append(
+                AdminServer(
+                    uvicorn.Config(
+                        create_admin_app(app.state.service, console),
+                        uds=socket,
+                        lifespan="off",
+                        access_log=False,
+                        log_level="warning",
+                    )
+                )
+            )
+        else:
+            print(f"  Note: {root} is too deep for an admin socket; no extra links.\n")
         await asyncio.gather(*(s.serve() for s in servers))
     return 0
 
