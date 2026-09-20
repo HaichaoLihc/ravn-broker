@@ -77,6 +77,33 @@ app's OAuth client ID/secret and user tokens. Slack requires user tokens and
 an internal or Marketplace app; Gmail access depends on preview availability
 and applicable Google verification requirements.
 
+### 2c. Gmail without Developer Preview access
+
+The `gmail` connector above needs Workspace Developer Preview enrollment for
+Google's hosted `gmailmcp.googleapis.com`. Until you have that, use the
+`gmail_local` connector instead — gated identically, against a self-hosted
+wrapper over the real Gmail REST API:
+
+```yaml
+  - id: gmail
+    app_id: demo
+    connector: gmail_local
+    endpoint: http://127.0.0.1:8790/mcp
+    manifest: builtin:gmail-read-v1
+    schema_hashes: {}
+    oauth:
+      profile: google_web_pkce
+      client_id: YOUR_GOOGLE_CLIENT_ID
+      client_secret_file: /absolute/private/gmail.secret
+      scopes: [openid, email, https://www.googleapis.com/auth/gmail.readonly]
+```
+
+Its reviewed tools (`src/ravn/manifest.py`'s `GMAIL_LOCAL_SCHEMAS`) are
+read-only, so `gmail.compose` is never required or accepted. See
+[`examples/gmail_agent/README.md`](../examples/gmail_agent/README.md) for the
+wrapper server and a full walkthrough, including a runnable agent and a
+script that proves the gate refuses an unreviewed tool call.
+
 Run `uv run ravn config-check`, then start or restart `uv run ravn serve`.
 
 ## 3. Connect and approve tools
