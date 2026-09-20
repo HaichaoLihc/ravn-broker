@@ -128,6 +128,15 @@ CONNECTORS = {
         "manifest": "builtin:gmail-v1",
         "oauth_profile": "google_web_pkce",
     },
+    # A self-hosted stand-in for Google's own gmailmcp.googleapis.com, gated
+    # identically (same reviewed tool set, same OAuth profile) -- it exists
+    # only because Google's hosted server requires Workspace Developer
+    # Preview enrollment. See examples/gmail_agent/README.md.
+    "gmail_local": {
+        "endpoint": "http://127.0.0.1:8790/mcp",
+        "manifest": "builtin:gmail-read-v1",
+        "oauth_profile": "google_web_pkce",
+    },
 }
 
 
@@ -150,17 +159,21 @@ class OAuthConfig(Model):
 class Integration(Model):
     id: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$")
     app_id: str
-    connector: Literal["github_cloud", "slack", "gmail"] = "github_cloud"
+    connector: Literal["github_cloud", "slack", "gmail", "gmail_local"] = "github_cloud"
     transport: Literal["remote_mcp"] = "remote_mcp"
     endpoint: Literal[
         "https://api.githubcopilot.com/mcp/",
         "https://mcp.slack.com/mcp",
         "https://gmailmcp.googleapis.com/mcp/v1",
+        "http://127.0.0.1:8790/mcp",
     ] = "https://api.githubcopilot.com/mcp/"
     enabled: bool = True
-    manifest: Literal["builtin:github-issues-v1", "builtin:slack-read-v1", "builtin:gmail-v1"] = (
-        "builtin:github-issues-v1"
-    )
+    manifest: Literal[
+        "builtin:github-issues-v1",
+        "builtin:slack-read-v1",
+        "builtin:gmail-v1",
+        "builtin:gmail-read-v1",
+    ] = "builtin:github-issues-v1"
     schema_hashes: dict[str, str] = Field(default_factory=dict)
     oauth: OAuthConfig | None = None
 
@@ -193,6 +206,11 @@ class Integration(Model):
                 # does not need a second consent; approving the write requires it.
                 if "create_draft" in self.schema_hashes and GMAIL_COMPOSE not in scopes:
                     raise ValueError("Approving create_draft requires the gmail.compose scope")
+            elif self.connector == "gmail_local":
+                # No write tool is ever reviewed for this connector; compose is never needed.
+                required = {"openid", "email", GMAIL_READONLY}
+                if scopes != required:
+                    raise ValueError("gmail_local needs exactly openid, email, and gmail.readonly")
             elif not scopes <= (SLACK_SCOPES if self.connector == "slack" else set()) or (
                 self.connector == "slack" and not scopes
             ):

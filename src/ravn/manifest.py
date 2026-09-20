@@ -120,14 +120,40 @@ GMAIL_SCHEMAS = {
     ),
 }
 
+# examples/gmail_agent/mcp_server.py's self-hosted wrapper over the real Gmail
+# REST API, standing in for gmailmcp.googleapis.com where Workspace Developer
+# Preview access is unavailable. Same four read tools as GMAIL_SCHEMAS, but
+# the wrapper's own argument shapes (snake_case; no messageFormat). It also
+# serves create_draft (so visibility and permission can be shown as
+# independent), but that tool is deliberately never reviewed here.
+GMAIL_LOCAL_SCHEMAS = {
+    "search_threads": gmail_object(
+        {
+            "query": GMAIL_QUERY,
+            "page_size": {"type": "integer", "minimum": 1, "maximum": 20},
+            "page_token": PAGE_TOKEN,
+        },
+        ["query"],
+    ),
+    "get_thread": gmail_object({"thread_id": GMAIL_ID}, ["thread_id"]),
+    "get_message": gmail_object({"message_id": GMAIL_ID}, ["message_id"]),
+    "list_labels": gmail_object({}),
+}
+
 # Tools that change provider state. They are never retried and an ambiguous
 # outcome is recorded as unknown rather than failed.
 WRITE_TOOLS = {"gmail": {"create_draft": "Create a Gmail draft. Drafts are never sent."}}
-MANIFESTS = {"github_cloud": SCHEMAS, "slack": SLACK_SCHEMAS, "gmail": GMAIL_SCHEMAS}
+MANIFESTS = {
+    "github_cloud": SCHEMAS,
+    "slack": SLACK_SCHEMAS,
+    "gmail": GMAIL_SCHEMAS,
+    "gmail_local": GMAIL_LOCAL_SCHEMAS,
+}
 DESCRIPTIONS = {
     "github_cloud": "Read GitHub issues using {name}.",
     "slack": "Read Slack using {name}.",
     "gmail": "Read Gmail using {name}.",
+    "gmail_local": "Read Gmail using {name}.",
 }
 
 

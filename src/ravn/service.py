@@ -17,7 +17,7 @@ from ravn.common import Principal, RavnError, canonical, digest, identifier, now
 from ravn.config import Config
 from ravn.crypto import Cipher
 from ravn.github import GitHub
-from ravn.gmail import Gmail
+from ravn.gmail import Gmail, GmailLocal
 from ravn.manifest import check_schema, is_write, schema_hash, schemas_for, validate_arguments
 from ravn.oauth import Onboarding
 from ravn.permissions import effective_tools, session_rules
@@ -92,6 +92,10 @@ class Service:
         )
         self.providers.setdefault(
             "gmail", Gmail(config.limits.call_timeout_seconds, config.limits.result_bytes)
+        )
+        self.providers.setdefault(
+            "gmail_local",
+            GmailLocal(config.limits.call_timeout_seconds, config.limits.result_bytes),
         )
         self.provider = self.providers["github_cloud"]  # Backward-compatible test/inspection hook.
         self.oauth = Onboarding(self)
