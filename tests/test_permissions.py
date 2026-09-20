@@ -96,6 +96,69 @@ async def test_projection_reports_each_decision_and_effect(rig, console):
     ]
 
 
+async def denials(rig):
+    async with rig.service.store.transaction() as db:
+        return await rows(db, "SELECT * FROM events WHERE kind='call.denied' ORDER BY created_at")
+
+
+async def test_a_refused_call_is_recorded(rig, console):
+    """The refusal rolls its own transaction back, so it needs its own event."""
+    _, http = console
+    session = await rig.session(await rig.connection())
+    await deny(http, session, {"issue_read": False})
+    async with rig.mcp(session) as mcp:
+        with pytest.raises(MCPError):
+            await mcp.call_tool("issue_read", ISSUE)
+    found = await denials(rig)
+    assert len(found) == 1, "a denied call left no trace in the activity log"
+    assert found[0]["actor_kind"] == "runtime_session"
+    assert found[0]["actor_id"] == session["id"]
+    assert found[0]["subject_id"].endswith(":issue_read")
+    assert found[0]["request_id"].startswith("req_")
+
+
+async def test_a_refusal_outside_the_ceiling_is_also_recorded(rig, console):
+    session = await rig.session(await rig.connection())
+    async with rig.mcp(session) as mcp:
+        with pytest.raises(MCPError):
+            await mcp.call_tool("add_issue_comment", {"body": "hi"})
+    assert len(await denials(rig)) == 1
+
+
+async def test_a_successful_call_records_no_denial(rig, console):
+    session = await rig.session(await rig.connection())
+    async with rig.mcp(session) as mcp:
+        await mcp.call_tool("issue_read", ISSUE)
+    assert await denials(rig) == []
+
+
+async def test_every_refusal_is_recorded_not_just_the_first(rig, console):
+    _, http = console
+    session = await rig.session(await rig.connection())
+    await deny(http, session, {"issue_read": False})
+    async with rig.mcp(session) as mcp:
+        for _ in range(3):
+            with pytest.raises(MCPError):
+                await mcp.call_tool("issue_read", ISSUE)
+    assert len(await denials(rig)) == 3
+
+
+async def test_recording_a_denial_never_masks_the_refusal(rig, console, monkeypatch):
+    """An audit-store failure must not turn a refusal into something else."""
+    _, http = console
+    session = await rig.session(await rig.connection())
+    await deny(http, session, {"issue_read": False})
+
+    async def fail(*args, **kwargs):
+        raise RuntimeError("Synthetic audit failure")
+
+    monkeypatch.setattr("ravn.service.event", fail)
+    async with rig.mcp(session) as mcp:
+        with pytest.raises(MCPError) as error:
+            await mcp.call_tool("issue_read", ISSUE)
+    assert error.value.data["code"] == "permission_denied"
+
+
 async def test_change_is_audited_as_an_operator_action(rig, console):
     _, http = console
     session = await rig.session(await rig.connection())
@@ -240,3 +303,29 @@ async def test_revoked_session_permissions_cannot_be_edited_back_into_use(rig, c
         await http.get(PREFIX + f"/sessions/{session['id']}?app_id=demo&tenant_id=default")
     ).json()
     assert row["broker_access"] == "blocked" and row["current_tools"] == []
+
+
+@pytest.mark.parametrize(
+    "arguments,valid",
+    [
+        ({"channel_id": "C0123ABC"}, True),
+        ({"channel_id": "C0123ABC", "limit": 50}, True),
+        # Slack's own schema lets channel_id be a user ID, which reads a DM.
+        ({"channel_id": "U0123ABC"}, False),
+        ({"channel_id": "D0123ABC"}, False),
+        ({"channel_id": "G0123ABC"}, False),
+        ({"channel_id": "C0123ABC", "limit": 500}, False),
+        ({"channel_id": "C0123ABC", "latest": "1789873723.5"}, False),
+        ({}, False),
+    ],
+)
+def test_read_channel_never_accepts_a_direct_message(arguments, valid):
+    from ravn.common import RavnError
+    from ravn.manifest import validate_arguments
+
+    if valid:
+        validate_arguments("slack_read_channel", arguments, "slack")
+        return
+    with pytest.raises(RavnError) as error:
+        validate_arguments("slack_read_channel", arguments, "slack")
+    assert error.value.code == "invalid_arguments"

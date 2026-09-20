@@ -33,6 +33,8 @@ SCHEMAS = {
     },
 }
 
+PAGE_TOKEN = {"type": "string", "minLength": 1, "maxLength": 2048}
+
 SLACK_SCHEMAS = {
     name: {
         "type": "object",
@@ -55,8 +57,19 @@ SLACK_SCHEMAS["slack_read_thread"] = {
         "message_ts": {"type": "string", "pattern": r"^[0-9]{1,20}\.[0-9]{1,10}$"},
     },
 }
+# Slack's own channel_id here accepts a user ID too, which would read direct
+# messages under a tool named "read channel". Public conversations only.
+SLACK_SCHEMAS["slack_read_channel"] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["channel_id"],
+    "properties": {
+        "channel_id": {"type": "string", "pattern": r"^C[A-Z0-9]{2,31}$"},
+        "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+        "cursor": PAGE_TOKEN,
+    },
+}
 
-PAGE_TOKEN = {"type": "string", "minLength": 1, "maxLength": 2048}
 GMAIL_ID = {"type": "string", "pattern": r"^[A-Za-z0-9_-]{1,128}$"}
 GMAIL_QUERY = {"type": "string", "minLength": 1, "maxLength": 2000}
 MESSAGE_FORMAT = {"type": "string", "enum": ["MINIMAL", "FULL_CONTENT", "METADATA_ONLY"]}

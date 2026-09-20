@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import hmac
 import json
+import logging
 import re
 import time
 from collections import Counter
@@ -447,7 +448,38 @@ class Service:
             },
         )
 
+    async def record_denial(self, p, cid, name, code, request_id):
+        """Audit a refusal in its own transaction.
+
+        The refusal is raised inside a transaction that then rolls back, so an
+        event written alongside it would be discarded with the rest of the work.
+        A failure to record must not mask the refusal itself.
+        """
+        try:
+            async with self.store.transaction() as db:
+                await event(
+                    db,
+                    p,
+                    "call.denied",
+                    f"{cid}:{name}"[:128],
+                    request_id=request_id,
+                )
+        except Exception:
+            logging.getLogger("ravn").warning("Could not record a denial for %s", name)
+
     async def execute(self, p, cid, name, arguments, request_id, idempotency_key=None):
+        """Run a tool call, recording any refusal that reaches the caller."""
+        try:
+            return await self._execute(p, cid, name, arguments, request_id, idempotency_key)
+        except Replayed:
+            raise
+        except RavnError as error:
+            # Refusals decided here, rather than upstream failures or tool errors.
+            if error.status in {401, 403, 409, 422}:
+                await self.record_denial(p, cid, name, error.code, request_id)
+            raise
+
+    async def _execute(self, p, cid, name, arguments, request_id, idempotency_key=None):
         async with self.store.transaction() as db:
             _, registered = await self.authorize(db, p, cid, execute=True, tool=name)
             validate_arguments(name, arguments, registered.connector)
