@@ -51,8 +51,52 @@ MESSAGES = [
 ]
 
 
+def search_markdown(query: str, hits: list) -> str:
+    """Slack's real search reply: Markdown for a person, not message objects.
+
+    Captured from the hosted server on 2026-09-19. Returning tidy JSON here
+    instead would hide the shape a client actually has to parse.
+    """
+    if not hits:
+        return f"# Search Results for: {query}\n\nNo results found.\n"
+    blocks = [f"# Search Results for: {query}\n", f"## Messages ({len(hits)} results)"]
+    for index, (channel, ts, name, text) in enumerate(hits, start=1):
+        blocks.append(
+            f"### Result {index} of {len(hits)}\n"
+            f"Channel: #{name} (ID: {channel})\n"
+            f"From: Simulated Teammate (ID: U01SIMULATED) \n"
+            f"Time: 2026-09-19 20:08:43 PDT\n"
+            f"Message_ts: {ts}\n"
+            f"Permalink: [link](https://simulated.slack.test/archives/{channel}/p{ts})\n"
+            f"Text: \n{text}\n"
+            f"Context before: \n- From:  (ID: U00) \n  Message_ts: {ts}\n  joined the channel\n"
+            f"\n---\n"
+        )
+    return "\n".join(blocks)
+
+
+def thread_markdown(found: list) -> str:
+    if not found:
+        return "No messages\n"
+    parent = found[0]
+    out = (
+        "=== THREAD PARENT MESSAGE ===\n"
+        f"From: Simulated Teammate (U01SIMULATED)\n"
+        "Time: 2026-09-19 20:08:43 PDT\n"
+        f"Message TS: {parent[1]}\n{parent[3]}\n\n"
+    )
+    for _channel, ts, _name, text in found[1:]:
+        out += (
+            "=== THREAD REPLY ===\n"
+            f"From: Simulated Teammate (U01SIMULATED)\n"
+            "Time: 2026-09-19 20:09:00 PDT\n"
+            f"Message TS: {ts}\n{text}\n\n"
+        )
+    return out
+
+
 class FakeSlack:
-    """Answers the Slack tools RAVN reviews, and nothing else."""
+    """Answers the Slack tools RAVN reviews, in the shape Slack really answers."""
 
     def __init__(self):
         self.calls: list[tuple[str, dict]] = []
@@ -77,22 +121,16 @@ class FakeSlack:
         arguments = params.arguments or {}
         if params.name == "slack_read_thread":
             found = [m for m in MESSAGES if m[0] == arguments.get("channel_id")]
-            body = [{"user": "U01SIMULATED", "text": m[3], "ts": m[1]} for m in found]
+            payload = {"messages": thread_markdown(found), "pagination_info": "No more.\n"}
         else:
             term = str(arguments.get("query", "")).lower()
-            body = [
-                {
-                    "channel": {"id": m[0], "name": m[2]},
-                    "username": "simulated.teammate",
-                    "text": m[3],
-                    "ts": m[1],
-                    "permalink": f"https://simulated.slack.test/archives/{m[0]}/p{m[1]}",
-                }
-                for m in MESSAGES
-                if term in m[3].lower() or term in m[2]
-            ]
+            hits = [m for m in MESSAGES if term in m[3].lower() or term in m[2]]
+            payload = {
+                "results": search_markdown(arguments.get("query", ""), hits),
+                "pagination_info": "End of results - No more pages available.\\n",
+            }
         return types.CallToolResult(
-            content=[types.TextContent(type="text", text=json.dumps({"matches": body}))]
+            content=[types.TextContent(type="text", text=json.dumps(payload))]
         )
 
     def transport(self, host):
