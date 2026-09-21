@@ -448,12 +448,18 @@ class Service:
             },
         )
 
-    async def record_denial(self, p, cid, name, code, request_id):
-        """Audit a refusal in its own transaction.
+    async def record_denial(self, p, cid, name, arguments, code, request_id):
+        """Audit a refusal in its own transaction, as both an event and a call.
 
-        The refusal is raised inside a transaction that then rolls back, so an
-        event written alongside it would be discarded with the rest of the work.
+        The refusal is raised inside a transaction that then rolls back, so a
+        row written alongside it would be discarded with the rest of the work.
         A failure to record must not mask the refusal itself.
+
+        A denial never reaches admit(), so it never gets the calls row every
+        other outcome gets; without one it is invisible in the Calls view,
+        which is where an operator looks first. It gets a terminal row here
+        instead, with no 'running' state to pass through -- there was never
+        a dispatch to run.
         """
         try:
             async with self.store.transaction() as db:
@@ -463,6 +469,41 @@ class Service:
                     "call.denied",
                     f"{cid}:{name}"[:128],
                     request_id=request_id,
+                )
+                conn = await one(
+                    db,
+                    "SELECT integration_id FROM connections WHERE app_id=? AND tenant_id=? "
+                    "AND user_id=? AND id=?",
+                    (*p.namespace, cid),
+                )
+                if conn is None:
+                    return
+                integration = self.config.integration(p.app, conn["integration_id"])
+                connector = integration.connector if integration else "github_cloud"
+                fingerprint = self.cipher.fingerprint([*p.namespace, cid, name, arguments])
+                stamp = now()
+                await db.execute(
+                    "INSERT INTO calls(id,app_id,tenant_id,user_id,connection_id,session_id,tool,"
+                    "status,arguments_fingerprint,fingerprint_key_id,error_code,duration_ms,"
+                    "created_at,updated_at,completed_at,effect,idempotency_key_hash) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        identifier("call"),
+                        *p.namespace,
+                        cid,
+                        p.session_id,
+                        name,
+                        "denied",
+                        fingerprint,
+                        self.cipher.key_id,
+                        code,
+                        0,
+                        stamp,
+                        stamp,
+                        stamp,
+                        "write" if is_write(name, connector) else "read",
+                        None,
+                    ),
                 )
         except Exception:
             logging.getLogger("ravn").warning("Could not record a denial for %s", name)
@@ -476,7 +517,7 @@ class Service:
         except RavnError as error:
             # Refusals decided here, rather than upstream failures or tool errors.
             if error.status in {401, 403, 409, 422}:
-                await self.record_denial(p, cid, name, error.code, request_id)
+                await self.record_denial(p, cid, name, arguments, error.code, request_id)
             raise
 
     async def _execute(self, p, cid, name, arguments, request_id, idempotency_key=None):

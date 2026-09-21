@@ -364,7 +364,7 @@ class Console:
         statuses = {
             "connections": {"active", "disconnected", "reconnect_required"},
             "sessions": {"active", "expired", "revoked"},
-            "calls": {"running", "succeeded", "tool_error", "failed", "unknown"},
+            "calls": {"running", "succeeded", "tool_error", "failed", "unknown", "denied"},
         }
         if "status" in query and query["status"] not in statuses.get(table, set()):
             raise invalid("Unsupported record status.")
