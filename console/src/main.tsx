@@ -72,7 +72,7 @@ function State({ value }: { value: unknown }) {
   const label = String(value || 'unknown');
   const status = ['active', 'enabled', 'succeeded'].includes(label)
     ? 'ok'
-    : ['failed', 'tool_error'].includes(label)
+    : ['failed', 'tool_error', 'denied'].includes(label)
       ? 'risk'
       : ['blocked', 'unknown', 'running', 'reconnect_required'].includes(label)
         ? 'caution'
@@ -895,7 +895,7 @@ function ConsoleApp() {
       ? ['active', 'disconnected', 'reconnect_required']
       : resource === 'sessions'
         ? ['active', 'expired', 'revoked']
-        : ['running', 'succeeded', 'tool_error', 'failed', 'unknown'];
+        : ['running', 'succeeded', 'tool_error', 'failed', 'unknown', 'denied'];
   return (
     <div className="console-shell">
       {sidebar && (

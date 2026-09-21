@@ -132,6 +132,54 @@ async def test_a_successful_call_records_no_denial(rig, console):
     assert await denials(rig) == []
 
 
+async def denied_calls(rig):
+    async with rig.service.store.transaction() as db:
+        return await rows(db, "SELECT * FROM calls WHERE status='denied' ORDER BY created_at")
+
+
+async def test_a_refused_call_gets_a_calls_row_too(rig, console):
+    """A denial never reaches admit(), so the Calls view stays empty without this.
+
+    An operator's first look at Activity is the Calls tab, not Events -- a
+    denial invisible there is effectively invisible.
+    """
+    _, http = console
+    connection = await rig.connection()
+    session = await rig.session(connection)
+    await deny(http, session, {"issue_read": False})
+    async with rig.mcp(session) as mcp:
+        with pytest.raises(MCPError):
+            await mcp.call_tool("issue_read", ISSUE)
+    found = await denied_calls(rig)
+    assert len(found) == 1
+    call = found[0]
+    assert call["tool"] == "issue_read"
+    assert call["session_id"] == session["id"]
+    assert call["connection_id"] == connection["id"]
+    assert call["error_code"] == "permission_denied"
+    assert call["effect"] == "read"
+    assert call["idempotency_key_hash"] is None
+    assert call["completed_at"] is not None
+
+
+async def test_a_denied_calls_row_is_visible_through_the_console(rig, console):
+    _, http = console
+    session = await rig.session(await rig.connection())
+    await deny(http, session, {"issue_read": False})
+    async with rig.mcp(session) as mcp:
+        with pytest.raises(MCPError):
+            await mcp.call_tool("issue_read", ISSUE)
+    listed = (await http.get(PREFIX + "/calls?app_id=demo&tenant_id=default&status=denied")).json()
+    assert len(listed["data"]) == 1
+    assert listed["data"][0]["tool"] == "issue_read"
+    assert listed["data"][0]["status"] == "denied"
+
+
+# A denied write never blocking its idempotency key is covered end-to-end by
+# test_writes.py::test_a_denied_write_does_not_consume_its_idempotency_key;
+# this module has no reviewed write tool to repeat that with.
+
+
 async def test_every_refusal_is_recorded_not_just_the_first(rig, console):
     _, http = console
     session = await rig.session(await rig.connection())
