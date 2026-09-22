@@ -26,12 +26,16 @@ Initialize only a new deployment. In another terminal, `uv run ravn console`
 opens the local console. The broker uses port 8787; the console uses 8788.
 Follow [provider setup](docs/onboarding.md) to connect accounts and enable tools.
 
+See [examples/gmail_agent](examples/gmail_agent/README.md) for a runnable
+Gmail agent gated by the real broker, including a script that proves the
+gate refuses a tool the operator never reviewed.
+
 ## Develop
 
 ```sh
 uv run --locked pytest
-uv run --locked ruff format --check src tests
-uv run --locked ruff check src tests
+uv run --locked ruff format --check src tests examples
+uv run --locked ruff check src tests examples
 npm --prefix console ci --ignore-scripts
 npm --prefix console run format:check
 npm --prefix console test

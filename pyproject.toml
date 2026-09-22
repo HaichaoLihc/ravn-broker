@@ -19,6 +19,18 @@ dependencies = [
     "uvicorn>=0.34,<1",
 ]
 
+[project.optional-dependencies]
+# Only needed to run examples/gmail_agent/mcp_server.py, the self-hosted
+# Gmail MCP wrapper the gmail_local connector talks to; the base broker
+# install (and the gmail connector against Google's own hosted server) needs
+# none of this.
+gmail = [
+    "google-api-python-client>=2.150,<3",
+    "google-auth>=2.35,<3",
+    "anthropic>=0.40,<1",
+    "python-dotenv>=1.0,<2",
+]
+
 [project.scripts]
 ravn = "ravn.cli:main"
 
@@ -33,7 +45,7 @@ build-backend = "hatchling.build"
 packages = ["src/ravn"]
 
 [tool.hatch.build.targets.sdist]
-include = ["src/ravn", "tests", "docs", "console", "README.md", "LICENSE", "pyproject.toml", "uv.lock", ".gitignore"]
+include = ["src/ravn", "tests", "docs", "console", "examples", "README.md", "LICENSE", "pyproject.toml", "uv.lock", ".gitignore"]
 exclude = [
     "**/node_modules/**",
     "**/__pycache__/**",
