@@ -12,7 +12,7 @@ import uvicorn
 from fastapi import FastAPI, Request
 from starlette.responses import HTMLResponse, RedirectResponse
 
-from ravn.common import digest
+from ravn.common import RavnError, digest
 from ravn.onboarding_client import ConnectBinding
 
 
@@ -104,8 +104,21 @@ async def connect(config, args, backend_request):
                 )
                 if request.query_params.get("status") in {"denied", "failed"}:
                     binding.consumed = True
+                    error = ValueError("Provider authorization did not complete")
+                    if request.query_params["status"] == "failed":
+                        failure_code = "connection_failed"
+                        with contextlib.suppress(Exception):
+                            status = await backend_request(
+                                config, args, "GET", f"/v1/connect-sessions/{flow['id']}"
+                            )
+                            failure_code = status.get("failure_code", failure_code)
+                        error = RavnError(
+                            502,
+                            failure_code,
+                            "Connection failed. Check the RAVN server log for the failed stage and provider error code.",
+                        )
                     if not done.done():
-                        done.set_exception(ValueError("Provider authorization did not complete"))
+                        done.set_exception(error)
                     return HTMLResponse(
                         "Authorization did not complete. Return to the terminal.", status_code=400
                     )
@@ -123,7 +136,7 @@ async def connect(config, args, backend_request):
                     args,
                     "POST",
                     f"/v1/connect-sessions/{flow['id']}/complete",
-                    {"completion_code": code},
+                    {"completion_code": code, "label": getattr(args, "label", None)},
                 )
             except Exception:
                 # Recovery is a read, never replay the completion or OAuth exchange.

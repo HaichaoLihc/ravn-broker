@@ -8,13 +8,14 @@ from urllib.parse import urlsplit
 import httpx
 import pytest
 
+from ravn.common import RavnError
 from ravn.connect_cli import connect
 
 pytestmark = pytest.mark.anyio
 
 
 @pytest.mark.parametrize(
-    "outcome", ["success", "lost_completion_response", "denied", "unavailable"]
+    "outcome", ["success", "lost_completion_response", "denied", "unavailable", "provider_failed"]
 )
 async def test_cli_browser_binding_and_completion_recovery(config, monkeypatch, outcome):
     with socket.socket() as reserved:
@@ -24,7 +25,7 @@ async def test_cli_browser_binding_and_completion_recovery(config, monkeypatch, 
         return_url=f"http://127.0.0.1:{port}/return",
         user="alice",
         tenant=None,
-        integration="slack",
+        integration="records",
         reconnect=None,
         no_open=False,
     )
@@ -48,6 +49,8 @@ async def test_cli_browser_binding_and_completion_recovery(config, monkeypatch, 
                 raise ValueError("Response lost")
             return {"id": "conn_test"}
         if path == "/v1/connect-sessions/cs_test":
+            if outcome == "provider_failed":
+                return {"status": "failed", "failure_code": "provider_protocol_error"}
             if outcome == "unavailable":
                 raise ValueError("Backend unavailable")
             return {"status": "completed", "connection_id": "conn_test"}
@@ -63,9 +66,9 @@ async def test_cli_browser_binding_and_completion_recovery(config, monkeypatch, 
                 "app_state": saved["app_state"],
                 "completion_code": "x" * 43,
             }
-            if outcome == "denied":
+            if outcome in {"denied", "provider_failed"}:
                 query.pop("completion_code")
-                query["status"] = "denied"
+                query["status"] = "denied" if outcome == "denied" else "failed"
             async with httpx.AsyncClient(base_url=origin, trust_env=False) as browser:
                 assert (await browser.get("/return", params=query)).status_code == 400
                 assert (await browser.get(start)).status_code == 303
@@ -74,8 +77,17 @@ async def test_cli_browser_binding_and_completion_recovery(config, monkeypatch, 
                     await browser.get("/return", params={**query, "app_state": "wrong"})
                 ).status_code == 400
                 response = await browser.get("/return", params=query)
-                assert response.status_code == {"denied": 400, "unavailable": 502}.get(outcome, 200)
-            if outcome in {"denied", "unavailable"}:
+                assert response.status_code == {
+                    "denied": 400,
+                    "provider_failed": 400,
+                    "unavailable": 502,
+                }.get(outcome, 200)
+            if outcome == "provider_failed":
+                with pytest.raises(RavnError) as error:
+                    await task
+                assert error.value.code == "provider_protocol_error"
+                assert ("POST", "/v1/connect-sessions/cs_test/complete") not in calls
+            elif outcome in {"denied", "unavailable"}:
                 with pytest.raises(ValueError):
                     await task
                 assert ("POST", "/v1/connect-sessions/cs_test/cancel") in calls

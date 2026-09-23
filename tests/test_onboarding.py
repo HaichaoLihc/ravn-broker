@@ -8,36 +8,29 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 import httpx
 import httpx2
 import pytest
-from conftest import FakeGitHub, Rig
+from conftest import FakeProvider, Rig, add_application, records_integration
+from fake_tools import MAIL_SCHEMAS
 from mcp import types
 from mcp.server.transport_security import TransportSecuritySettings
 
-from ravn.app import create_app
+from ravn.app import create_admin_app, create_app
 from ravn.common import RavnError
-from ravn.config import GMAIL_COMPOSE, GMAIL_READONLY, Config
-from ravn.github import GitHub
-from ravn.gmail import Gmail
-from ravn.manifest import GMAIL_SCHEMAS, SLACK_SCHEMAS, schema_hash
+from ravn.integrations import IntegrationRegistration
 from ravn.oauth_provider import deadline
-from ravn.slack import Slack
+from ravn.provider import RemoteMCP
 from ravn.store import one, rows
 
 pytestmark = pytest.mark.anyio
 RETURN = "http://127.0.0.1:8800/return"
 APP_STATE = "app_transaction_0123456789"
-# Google reports the requested `email` scope in its long form.
-GMAIL_GRANTED = [
-    "openid",
-    "https://www.googleapis.com/auth/userinfo.email",
-    GMAIL_READONLY,
-    GMAIL_COMPOSE,
-]
+MAIL_GRANTED = ["openid", "email", "mail.read", "mail.draft"]
 
 
-class OAuthFake(FakeGitHub):
-    def __init__(self, slack=False, gmail=False):
+class OAuthFake(FakeProvider):
+    def __init__(self, mail=False):
         super().__init__()
-        self.slack, self.gmail = slack, gmail
+        self.mail = mail
+        self.client_secret = "test-client-secret"
         self.exchanges = []
         self.refreshes = []
         self.rotation_failure = False
@@ -45,38 +38,23 @@ class OAuthFake(FakeGitHub):
         self.rotation_entered = asyncio.Event()
         self.rotation_release = asyncio.Event()
         self.tokens = {}
-        if gmail:
-            self.tools = [types.Tool(name=n, inputSchema=s) for n, s in GMAIL_SCHEMAS.items()]
+        if mail:
+            self.tools = [types.Tool(name=n, inputSchema=s) for n, s in MAIL_SCHEMAS.items()]
             self.app = self.server.streamable_http_app(
                 streamable_http_path="/mcp/v1",
                 stateless_http=True,
                 json_response=True,
                 transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
             )
-        if slack:
-            self.tools = [types.Tool(name=n, inputSchema=s) for n, s in SLACK_SCHEMAS.items()]
-            self.tools.append(
-                types.Tool(
-                    name="slack_send_message",
-                    inputSchema={"type": "object"},
-                    annotations=types.ToolAnnotations(readOnlyHint=True),
-                )
-            )
-            self.app = self.server.streamable_http_app(
-                streamable_http_path="/mcp",
-                stateless_http=True,
-                json_response=True,
-                transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
-            )
 
     def transport(self, host):
-        if host in {"api.githubcopilot.com", "mcp.slack.com", "gmailmcp.googleapis.com"}:
+        if host in {"mcp.records.example", "mcp.mail.example"}:
             return httpx2.ASGITransport(app=self.app)
 
         async def request(req):
-            if req.url.path in {"/login/oauth/access_token", "/api/oauth.v2.user.access", "/token"}:
+            if req.url.path in {"/token"}:
                 params = {k: v[0] for k, v in parse_qs(req.content.decode()).items()}
-                assert params["client_secret"] == "test-client-secret"
+                assert params["client_secret"] == self.client_secret
                 assert not req.url.query
                 refresh = params["grant_type"] == "refresh_token"
                 (self.refreshes if refresh else self.exchanges).append(params)
@@ -93,21 +71,21 @@ class OAuthFake(FakeGitHub):
                     return httpx2.Response(
                         200, json={"error": "bad_verification_code", "echo": "SECRET"}
                     )
-                prefix = "ya29." if self.gmail else "xoxp-" if self.slack else "ghu_"
+                prefix = "mail_" if self.mail else "record_"
                 access = prefix + who + ("-new" if refresh else "-old")
                 self.tokens[access] = (
                     "T222" if who == "workspace" else "T111",
                     "U222" if who == "bob" else "U111",
                 )
-                if self.gmail:
-                    # Google's shape: URL scopes, and refresh never rotates the refresh token.
+                if self.mail:
+                    # Stable refresh profile: URL scopes, and refresh never rotates the refresh token.
                     return httpx2.Response(
                         200,
                         json={
                             "access_token": access,
                             "token_type": "Bearer",
                             "expires_in": 3599,
-                            "scope": " ".join(GMAIL_GRANTED),
+                            "scope": " ".join(MAIL_GRANTED),
                             **({} if refresh else {"refresh_token": "test-refresh-" + access}),
                         },
                     )
@@ -116,18 +94,18 @@ class OAuthFake(FakeGitHub):
                     json={
                         "ok": True,
                         "access_token": access,
-                        "token_type": "user" if self.slack else "bearer",
+                        "token_type": "bearer",
                         "refresh_token": "test-refresh-" + access,
                         "expires_in": 3600,
                         "refresh_token_expires_in": 86400,
-                        "scope": "search:read.public" if self.slack else "",
+                        "scope": "records.read",
                     },
                 )
             access = req.headers.get("authorization", "").removeprefix("Bearer ")
             if access not in self.tokens:
                 return httpx2.Response(401, json={"ok": False, "error": "invalid_auth"})
             team, user = self.tokens[access]
-            if self.gmail:
+            if self.mail:
                 bob = user == "U222"
                 return httpx2.Response(
                     200,
@@ -152,69 +130,44 @@ class OAuthFake(FakeGitHub):
 
 
 @pytest.fixture
-async def oauth_rig(config, tmp_path):
-    secret = tmp_path / "oauth-secret"
-    secret.write_text("test-client-secret")
-    secret.chmod(0o600)
-    value = config.model_dump(mode="json")
-    for app in value["applications"]:
-        app["return_urls"] = [RETURN]
-    for i in value["integrations"]:
-        i["oauth"] = {
-            "client_id": "test-github",
-            "client_secret_file": str(secret),
-            "profile": "github_app_pkce",
-        }
-    github, slack, gmail = OAuthFake(), OAuthFake(slack=True), OAuthFake(gmail=True)
-    for app in value["applications"]:
-        value["integrations"].append(
-            {
-                "id": "gmail",
-                "app_id": app["id"],
-                "connector": "gmail",
-                "endpoint": "https://gmailmcp.googleapis.com/mcp/v1",
-                "manifest": "builtin:gmail-v1",
-                "schema_hashes": {t.name: schema_hash(t) for t in gmail.tools},
-                "oauth": {
-                    "client_id": "test-google",
-                    "client_secret_file": str(secret),
-                    "profile": "google_web_pkce",
-                    "scopes": ["openid", "email", GMAIL_READONLY, GMAIL_COMPOSE],
-                },
-            }
-        )
-        value["integrations"].append(
-            {
-                "id": "slack",
-                "app_id": app["id"],
-                "connector": "slack",
-                "endpoint": "https://mcp.slack.com/mcp",
-                "manifest": "builtin:slack-read-v1",
-                "schema_hashes": {
-                    t.name: schema_hash(t) for t in slack.tools if t.name in SLACK_SCHEMAS
-                },
-                "oauth": {
-                    "client_id": "test-slack",
-                    "client_secret_file": str(secret),
-                    "profile": "slack_user_confidential",
-                    "scopes": ["search:read.public", "channels:history"],
-                },
-            }
-        )
-    config = Config.model_validate(value)
-    app = create_app(
-        config,
-        provider={
-            "github_cloud": GitHub(transport_factory=github.transport),
-            "slack": Slack(transport_factory=slack.transport),
-            "gmail": Gmail(transport_factory=gmail.transport),
-        },
-    )
+async def oauth_rig(config):
+    records, mail = OAuthFake(), OAuthFake(mail=True)
+    fakes = {"records": records, "mail": mail}
+    app = create_app(config)
     async with AsyncExitStack() as stack:
-        await stack.enter_async_context(github.server.session_manager.run())
-        await stack.enter_async_context(slack.server.session_manager.run())
-        await stack.enter_async_context(gmail.server.session_manager.run())
+        for fake in fakes.values():
+            await stack.enter_async_context(fake.server.session_manager.run())
         await stack.enter_async_context(app.router.lifespan_context(app))
+        service = app.state.service
+        for app_id, mode in [("demo", "single"), ("saas", "multi")]:
+            await add_application(service, app_id, tenant_mode=mode, return_urls=[RETURN])
+            for kind in ("records", "mail"):
+                value = records_integration(app_id).model_dump(mode="json")
+                if kind == "mail":
+                    value.update(
+                        id="mail",
+                        endpoint="https://mcp.mail.example/mcp/v1",
+                        identity={
+                            "endpoint": "https://identity.mail.example/userinfo",
+                            "required_claims": {"email_verified": True},
+                        },
+                    )
+                value["oauth"] = {
+                    "client_id": "test-client",
+                    "client_secret": "test-client-secret",
+                    "authorization_endpoint": "https://auth.example/authorize",
+                    "token_endpoint": "https://auth.example/token",
+                    "issuer": "https://auth.example",
+                    "rotating_refresh_tokens": kind == "records",
+                    "scopes": MAIL_GRANTED if kind == "mail" else ["records.read"],
+                    "authorization_params": {"access_type": "offline", "prompt": "consent"},
+                }
+                item = IntegrationRegistration.model_validate(value)
+                await service.integrations.create(item)
+                service.providers[(app_id, kind)] = RemoteMCP(
+                    item, transport_factory=fakes[kind].transport
+                )
+
         http = await stack.enter_async_context(
             httpx.AsyncClient(
                 transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1:8787"
@@ -222,13 +175,12 @@ async def oauth_rig(config, tmp_path):
         )
         key = (await app.state.service.create_key("demo", "test"))["key"]
         saas = (await app.state.service.create_key("saas", "test"))["key"]
-        rig = Rig(app, http, github, key, saas)
-        rig.slack, rig.gmail = slack, gmail
-        rig.fakes = {"github": github, "slack": slack, "gmail": gmail}
+        rig = Rig(app, http, records, key, saas)
+        rig.mail, rig.fakes = mail, fakes
         yield rig
 
 
-async def start(rig, provider="github", headers=None, reconnect=None):
+async def start(rig, provider="records", headers=None, reconnect=None):
     headers = headers or rig.headers()
     payload = {"integration_id": provider, "return_url": RETURN, "app_state": APP_STATE}
     if reconnect:
@@ -244,7 +196,7 @@ async def start(rig, provider="github", headers=None, reconnect=None):
     return flow
 
 
-async def stage(rig, provider="github", code="alice", headers=None, reconnect=None):
+async def stage(rig, provider="records", code="alice", headers=None, reconnect=None):
     flow = await start(rig, provider, headers, reconnect)
     response = await rig.http.get(
         flow["callback"], params={"state": flow["authorize"]["state"], "code": code}
@@ -264,11 +216,29 @@ async def complete(rig, flow, headers=None):
     )
 
 
-async def connected(rig, provider="github"):
+async def connected(rig, provider="records"):
     flow = await stage(rig, provider)
     result = await complete(rig, flow)
     assert result.status_code == 200, result.text
     return result.json()
+
+
+@pytest.mark.parametrize("phase", ["token_exchange", "account_verification"])
+async def test_oauth_failure_log_identifies_stage_without_credentials(
+    oauth_rig, monkeypatch, caplog, phase
+):
+    rig = oauth_rig
+    if phase == "account_verification":
+
+        async def fail_identity(_):
+            raise ValueError("SECRET")
+
+        monkeypatch.setattr(rig.service.providers[("demo", "records")], "identify", fail_identity)
+    flow = await stage(rig, code="bad" if phase == "token_exchange" else "alice")
+    assert flow["return"]["status"] == "failed"
+    assert f"session={flow['id']} phase={phase}" in caplog.text
+    assert "SECRET" not in caplog.text
+    assert "test-client-secret" not in caplog.text
 
 
 async def expire_credential(rig, cid):
@@ -289,7 +259,41 @@ async def expire_credential(rig, cid):
         )
 
 
-@pytest.mark.parametrize("provider", ["github", "slack", "gmail"])
+async def test_registered_oauth_uses_saved_secret_for_connect_and_refresh(oauth_rig):
+    rig = oauth_rig
+    body = rig.service.integrations.get("demo", "records").model_dump(mode="json")
+    body["id"] = "registered"
+    body["oauth"]["client_secret"] = "registered-client-secret"
+    rig.fake.client_secret = "registered-client-secret"
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_admin_app(rig.service)), base_url="http://admin"
+    ) as admin:
+        response = await admin.post("/admin/v1/integrations", json=body)
+        assert response.status_code == 201, response.text
+    item = rig.service.integrations.get("demo", "registered")
+    rig.service.providers[("demo", "registered")] = RemoteMCP(
+        item, transport_factory=rig.fake.transport
+    )
+    conn = await connected(rig, "registered")
+    assert rig.fake.exchanges[-1]["client_secret"] == "registered-client-secret"
+    session = await rig.session(conn)
+    await expire_credential(rig, conn["id"])
+    async with rig.mcp(session) as client:
+        assert (await client.list_tools()).tools
+    assert rig.fake.refreshes[-1]["grant_type"] == "refresh_token"
+    assert rig.fake.refreshes[-1]["client_secret"] == "registered-client-secret"
+    # Registered secrets persist without configuration or secret files.
+    await rig.service.close()
+    await rig.service.start()
+    assert (
+        rig.service.integrations.get("demo", "registered").oauth.client_secret.get_secret_value()
+        == "registered-client-secret"
+    )
+    rig.fake.client_secret = "test-client-secret"
+    assert (await connected(rig))["status"] == "active"
+
+
+@pytest.mark.parametrize("provider", ["records", "mail"])
 async def test_oauth_stages_then_activates_and_runs_real_mcp_sdk(oauth_rig, provider):
     rig = oauth_rig
     flow = await stage(rig, provider)
@@ -301,24 +305,19 @@ async def test_oauth_stages_then_activates_and_runs_real_mcp_sdk(oauth_rig, prov
     result = await complete(rig, flow)
     assert result.status_code == 200, result.text
     conn = result.json()
-    assert conn["provider_account_id"] == ("T111:U111" if provider == "slack" else "101")
-    assert all(prefix not in result.text for prefix in ("ghu_", "xoxp-", "ya29."))
+    assert conn["provider_account_id"] == "101"
+    assert all(prefix not in result.text for prefix in ("record_", "mail_"))
     session = await rig.session(conn)
     async with rig.mcp(session) as client:
         tools = (await client.list_tools()).tools
-        if provider == "slack":
-            assert {t.name for t in tools} == set(SLACK_SCHEMAS)
-            result = await client.call_tool("slack_search_public", {"query": "project ravn"})
-            assert rig.slack.calls[-1][0] == "xoxp-alice-old"
-            assert "x-mcp-toolsets" not in rig.slack.headers[-1]
-        elif provider == "gmail":
-            assert {t.name for t in tools} == set(GMAIL_SCHEMAS)
+        if provider == "mail":
+            assert {t.name for t in tools} == {client.ravn_name(n) for n in MAIL_SCHEMAS}
             assert conn["display_name"] == "alice@example.com"
-            result = await client.call_tool("search_threads", {"query": "refund"})
-            assert rig.gmail.calls[-1][0] == "ya29.alice-old"
+            result = await client.call_tool(client.ravn_name("search_threads"), {"query": "refund"})
+            assert rig.mail.calls[-1][0] == "mail_alice-old"
             authorize = flow["authorize"]
             assert authorize["access_type"] == "offline" and authorize["prompt"] == "consent"
-            verifier = rig.gmail.exchanges[0]["code_verifier"]
+            verifier = rig.mail.exchanges[0]["code_verifier"]
             assert (
                 authorize["code_challenge"]
                 == base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest())
@@ -326,8 +325,10 @@ async def test_oauth_stages_then_activates_and_runs_real_mcp_sdk(oauth_rig, prov
                 .decode()
             )
         else:
-            result = await client.call_tool("list_issues", {"owner": "acme", "repo": "test"})
-            assert rig.fake.calls[-1][0] == "ghu_alice-old"
+            result = await client.call_tool(
+                client.ravn_name("list_issues"), {"owner": "acme", "repo": "test"}
+            )
+            assert rig.fake.calls[-1][0] == "record_alice-old"
             verifier = rig.fake.exchanges[0]["code_verifier"]
             assert (
                 flow["authorize"]["code_challenge"]
@@ -356,7 +357,7 @@ async def test_oauth_stages_then_activates_and_runs_real_mcp_sdk(oauth_rig, prov
         )
         events = await rows(db, "SELECT * FROM events")
         assert "test-refresh" not in repr(events)
-        assert all(prefix not in repr(events) for prefix in ("ghu_", "xoxp-", "ya29."))
+        assert all(prefix not in repr(events) for prefix in ("record_", "mail_"))
 
 
 async def test_browser_cookie_state_replay_and_duplicate_queries(oauth_rig):
@@ -373,7 +374,7 @@ async def test_browser_cookie_state_replay_and_duplicate_queries(oauth_rig):
     assert (await rig.http.get(flow["callback"] + "?" + query)).status_code == 400
     rig.http.cookies = cookie
     assert (
-        await rig.http.get(flow["callback"].replace("demo/github", "demo/slack") + "?" + query)
+        await rig.http.get(flow["callback"].replace("demo/records", "demo/mail") + "?" + query)
     ).status_code == 400
     assert (await rig.http.get(flow["callback"] + "?" + query)).status_code == 303
     assert (await rig.http.get(flow["callback"] + "?" + query)).status_code == 400
@@ -404,7 +405,7 @@ async def test_exact_return_allowlist(oauth_rig, suffix):
     response = await oauth_rig.http.post(
         "/v1/connect-sessions",
         headers=oauth_rig.headers(),
-        json={"integration_id": "github", "return_url": RETURN + suffix, "app_state": APP_STATE},
+        json={"integration_id": "records", "return_url": RETURN + suffix, "app_state": APP_STATE},
     )
     assert response.status_code == 400
 
@@ -451,8 +452,8 @@ async def test_provider_denial_and_failure_never_return_provider_diagnostics(oau
     assert "SECRET" not in str(flow)
 
 
-@pytest.mark.parametrize("provider", ["github", "slack", "gmail"])
-async def test_reconnect_preserves_identity_invalidates_sessions(oauth_rig, provider):
+@pytest.mark.parametrize("provider", ["records", "mail"])
+async def test_reconnect_preserves_identity_invalidates_attachments(oauth_rig, provider):
     rig = oauth_rig
     conn = await connected(rig, provider)
     session = await rig.session(conn)
@@ -461,14 +462,17 @@ async def test_reconnect_preserves_identity_invalidates_sessions(oauth_rig, prov
     assert (await rig.http.get(f"/v1/connections/{conn['id']}", headers=rig.headers())).json()[
         "epoch"
     ] == 1
-    if provider == "slack":
-        mismatch = await stage(rig, provider, code="workspace", reconnect=conn["id"])
-        assert mismatch["return"]["status"] == "failed"
     flow = await stage(rig, provider, reconnect=conn["id"])
     result = await complete(rig, flow)
     assert result.json()["id"] == conn["id"] and result.json()["epoch"] == 2
+    principal = await rig.service.authenticate_session(session["token"])
     with pytest.raises(RavnError):
-        await rig.service.authenticate_session(session["token"])
+        await rig.service.discover(principal, conn["id"])
+    response = await rig.http.put(
+        f"/v1/sessions/{session['id']}/connections/{conn['id']}", headers=rig.headers()
+    )
+    assert response.status_code == 200
+    assert await rig.service.discover(principal, conn["id"])
 
 
 async def test_disconnect_wins_pending_reconnect(oauth_rig):
@@ -482,7 +486,7 @@ async def test_disconnect_wins_pending_reconnect(oauth_rig):
         assert conn["ciphertext"] is None and conn["status"] == "disconnected"
 
 
-@pytest.mark.parametrize("provider", ["github", "slack", "gmail"])
+@pytest.mark.parametrize("provider", ["records", "mail"])
 async def test_refresh_single_flight_preserves_runtime_epoch(oauth_rig, provider):
     rig = oauth_rig
     conn = await connected(rig, provider)
@@ -492,8 +496,8 @@ async def test_refresh_single_flight_preserves_runtime_epoch(oauth_rig, provider
     values = await asyncio.gather(*(rig.service.discover(p, conn["id"]) for _ in range(4)))
     fake = rig.fakes[provider]
     assert len(fake.refreshes) == 1 and all(values)
-    if provider == "gmail":
-        # Google's refresh response omits the refresh token; the stable one is kept.
+    if provider == "mail":
+        # The provider's refresh response omits the refresh token; the stable one is kept.
         async with rig.service.store.transaction() as db:
             row = await one(db, "SELECT * FROM connections WHERE id=?", (conn["id"],))
         bundle = json.loads(
@@ -501,8 +505,8 @@ async def test_refresh_single_flight_preserves_runtime_epoch(oauth_rig, provider
                 row["ciphertext"], row["app_id"], row["tenant_id"], row["id"]
             )
         )
-        assert bundle["refresh_token"] == "test-refresh-ya29.alice-old"
-        assert bundle["access_token"] == "ya29.alice-new"
+        assert bundle["refresh_token"] == "test-refresh-mail_alice-old"
+        assert bundle["access_token"] == "mail_alice-new"
     async with rig.service.store.transaction() as db:
         row = await one(db, "SELECT * FROM connections WHERE id=?", (conn["id"],))
         assert (
@@ -510,6 +514,44 @@ async def test_refresh_single_flight_preserves_runtime_epoch(oauth_rig, provider
         )
     await rig.service.authenticate_session(session["token"])
     assert not rig.service.oauth.refresh_locks
+
+
+@pytest.mark.parametrize("action", ["detach", "revoke", "expire"])
+async def test_refresh_preserves_shared_connection_when_caller_loses_access(oauth_rig, action):
+    rig = oauth_rig
+    conn = await connected(rig)
+    first, second = await rig.session(conn), await rig.session(conn)
+    caller = await rig.service.authenticate_session(first["token"])
+    other = await rig.service.authenticate_session(second["token"])
+    await expire_credential(rig, conn["id"])
+    rig.fake.rotation_block = True
+    pending = asyncio.create_task(rig.service.discover(caller, conn["id"]))
+    await asyncio.wait_for(rig.fake.rotation_entered.wait(), 2)
+    try:
+        if action == "detach":
+            response = await rig.http.delete(
+                f"/v1/sessions/{first['id']}/connections/{conn['id']}", headers=rig.headers()
+            )
+            assert response.status_code == 200
+        elif action == "revoke":
+            response = await rig.http.post(
+                f"/v1/sessions/{first['id']}/revoke", headers=rig.headers()
+            )
+            assert response.status_code == 200
+        else:
+            async with rig.service.store.transaction() as db:
+                await db.execute(
+                    "UPDATE sessions SET expires_at='2000-01-01T00:00:00Z' WHERE id=?",
+                    (first["id"],),
+                )
+    finally:
+        rig.fake.rotation_release.set()
+    with pytest.raises(RavnError):
+        await pending
+    current = (await rig.http.get(f"/v1/connections/{conn['id']}", headers=rig.headers())).json()
+    assert current["status"] == "active"
+    assert await rig.service.discover(other, conn["id"])
+    assert len(rig.fake.refreshes) == 1
 
 
 @pytest.mark.parametrize("race", ["disconnect", "reconnect", "cancel", "lost_response"])
@@ -544,6 +586,32 @@ async def test_refresh_uncertainty_and_concurrent_lifecycle(oauth_rig, race):
         assert len(rig.fake.refreshes) == 1
 
 
+@pytest.mark.parametrize("refresh_fails", [False, True])
+async def test_late_rejection_during_refresh_defers_to_refresh_outcome(oauth_rig, refresh_fails):
+    rig = oauth_rig
+    conn = await connected(rig)
+    p = await rig.service.authenticate_app(rig.key, "alice", None)
+    old, _ = await rig.service.credential(p, conn["id"])
+    await expire_credential(rig, conn["id"])
+    rig.fake.rotation_block = True
+    rig.fake.rotation_failure = refresh_fails
+    pending = asyncio.create_task(rig.service.discover(p, conn["id"]))
+    await asyncio.wait_for(rig.fake.rotation_entered.wait(), 2)
+    try:
+        await rig.service.oauth.rejected(p, conn["id"], old)
+    finally:
+        rig.fake.rotation_release.set()
+    if refresh_fails:
+        with pytest.raises(RavnError):
+            await pending
+    else:
+        assert await pending
+        # The same old response is harmless after the new credential is saved, too.
+        await rig.service.oauth.rejected(p, conn["id"], old)
+    current = (await rig.http.get(f"/v1/connections/{conn['id']}", headers=rig.headers())).json()
+    assert current["status"] == ("reconnect_required" if refresh_fails else "active")
+
+
 async def test_restart_uncertain_refresh_and_interrupted_exchange(oauth_rig):
     rig = oauth_rig
     conn = await connected(rig)
@@ -566,42 +634,16 @@ async def test_restart_uncertain_refresh_and_interrupted_exchange(oauth_rig):
     assert not rig.fake.refreshes
 
 
-async def test_slack_import_rejects_bot_token(oauth_rig):
-    response = await oauth_rig.http.post(
-        "/v1/connections/import",
-        headers=oauth_rig.headers(),
-        json={
-            "integration_id": "slack",
-            "credential": {"type": "bearer", "token": "xoxb-bot-token"},
-        },
-    )
-    assert response.status_code == 400
-
-
-async def test_slack_cross_provider_and_writes_blocked(oauth_rig):
-    rig = oauth_rig
-    conn = await connected(rig, "slack")
-    session = await rig.session(conn)
-    p = await rig.service.authenticate_session(session["token"])
-    for name, args in [
-        ("list_issues", {"owner": "acme", "repo": "test"}),
-        ("slack_send_message", {"text": "hi"}),
-    ]:
-        with pytest.raises(RavnError):
-            await rig.service.execute(p, conn["id"], name, args, "request")
-    assert not rig.slack.calls and not rig.fake.calls
-
-
 async def test_inspection_uses_stored_oauth_without_exposing_tokens(oauth_rig):
     rig = oauth_rig
-    conn = await connected(rig, "slack")
+    conn = await connected(rig, "mail")
     response = await rig.http.get(
         f"/v1/connections/{conn['id']}/tool-schemas", headers=rig.headers()
     )
     assert response.status_code == 200 and set(response.json()["schema_hashes"]) == set(
-        SLACK_SCHEMAS
+        MAIL_SCHEMAS
     )
-    assert "xoxp-" not in response.text and "slack_send_message" not in response.text
+    assert "mail_alice-old" not in response.text
     assert (
         await rig.http.get(f"/v1/connections/{conn['id']}/tool-schemas", headers=rig.headers("bob"))
     ).status_code == 404
@@ -610,18 +652,23 @@ async def test_inspection_uses_stored_oauth_without_exposing_tokens(oauth_rig):
 async def test_http_auth_failure_marks_reconnect_not_provider_outage(oauth_rig):
     rig = oauth_rig
     conn = await connected(rig)
-    original = rig.service.provider.transport_factory
+    original = rig.service.provider_for(
+        rig.service.integrations.get("demo", "records")
+    ).transport_factory
 
     def rejected(host):
-        if host == "api.githubcopilot.com":
+        if host == "mcp.records.example":
             return httpx2.MockTransport(lambda req: httpx2.Response(401, json={"error": "SECRET"}))
         return original(host)
 
-    rig.service.provider.transport_factory = rejected
-    response = await rig.http.post(
-        "/v1/sessions", headers=rig.headers(), json={"connection_id": conn["id"]}
-    )
-    assert response.status_code == 401 and "SECRET" not in response.text
+    rig.service.provider_for(
+        rig.service.integrations.get("demo", "records")
+    ).transport_factory = rejected
+    session = await rig.session(conn)
+    principal = await rig.service.authenticate_session(session["token"])
+    with pytest.raises(RavnError) as error:
+        await rig.service.discover(principal, conn["id"])
+    assert error.value.code == "credential_invalid" and "SECRET" not in str(error.value)
     assert (await rig.http.get(f"/v1/connections/{conn['id']}", headers=rig.headers())).json()[
         "status"
     ] == "reconnect_required"
@@ -657,34 +704,96 @@ async def test_pending_limit_and_completion_expiry_bounded(oauth_rig):
     response = await rig.http.post(
         "/v1/connect-sessions",
         headers=rig.headers(),
-        json={"integration_id": "github", "return_url": RETURN, "app_state": APP_STATE},
+        json={"integration_id": "records", "return_url": RETURN, "app_state": APP_STATE},
     )
     assert response.status_code == 429
 
 
 async def test_two_browser_transactions_can_complete_independently(oauth_rig):
     rig = oauth_rig
-    first, second = await start(rig), await start(rig, "slack")
+    first, second = await start(rig), await start(rig, "mail")
     for flow in (first, second):
         response = await rig.http.get(
             flow["callback"], params={"state": flow["authorize"]["state"], "code": "alice"}
         )
         assert response.status_code == 303
-    assert len(rig.fake.exchanges) == len(rig.slack.exchanges) == 1
+    assert len(rig.fake.exchanges) == len(rig.mail.exchanges) == 1
 
 
-@pytest.mark.parametrize("change", ["redirect", "connector", "scope", "profile"])
-async def test_config_rejects_unregistered_oauth_destinations(oauth_rig, change):
-    value = oauth_rig.service.config.model_dump(mode="json")
-    if change == "redirect":
-        value["applications"][0]["return_urls"] = ["https://app.example/return?redirect=evil"]
-    elif change == "connector":
-        value["integrations"][0]["endpoint"] = "https://evil.example/mcp"
-    elif change == "scope":
-        value["integrations"][-1]["oauth"]["scopes"] = ["chat:write"]
-    else:
-        value["integrations"][0]["oauth"]["profile"] = "slack_user_confidential"
-    from pydantic import ValidationError
+async def test_multi_service_session_survives_refresh_and_other_account_reauthorization(oauth_rig):
+    rig = oauth_rig
+    records, mail = await connected(rig), await connected(rig, "mail")
+    response = await rig.http.post(
+        "/v1/sessions", headers=rig.headers(), json={"connection_ids": [records["id"], mail["id"]]}
+    )
+    assert response.status_code == 201
+    session = response.json()
+    await expire_credential(rig, mail["id"])
+    async with rig.mcp(session) as client:
+        result = await client.list_tools()
+        assert {t.meta["ravn/connection-id"] for t in result.tools} == {records["id"], mail["id"]}
+        assert rig.mail.refreshes
+        flow = await stage(rig, reconnect=records["id"])
+        assert (await complete(rig, flow)).status_code == 200
+        result = await client.list_tools()
+        assert {t.meta["ravn/connection-id"] for t in result.tools} == {mail["id"]}
+        assert result.meta["ravn/unavailable-connections"] == [
+            {"connection_id": records["id"], "code": "connection_not_attached"}
+        ]
+        assert (
+            await rig.http.put(
+                f"/v1/sessions/{session['id']}/connections/{records['id']}", headers=rig.headers()
+            )
+        ).status_code == 200
+        assert {t.meta["ravn/connection-id"] for t in (await client.list_tools()).tools} == {
+            records["id"],
+            mail["id"],
+        }
+        await rig.http.post(f"/v1/connections/{records['id']}/disconnect", headers=rig.headers())
+        assert {t.meta["ravn/connection-id"] for t in (await client.list_tools()).tools} == {
+            mail["id"]
+        }
 
-    with pytest.raises(ValidationError):
-        Config.model_validate(value)
+
+async def test_oauth_without_identity_creates_distinct_connections_and_refreshes(oauth_rig):
+    rig = oauth_rig
+    item = rig.service.integrations.get("demo", "records").model_copy(update={"identity": None})
+    rig.service.integrations.items[("demo", "records")] = item
+    rig.service.providers[("demo", "records")] = RemoteMCP(
+        item, transport_factory=rig.fake.transport
+    )
+    flow = await stage(rig)
+    response = await rig.http.post(
+        f"/v1/connect-sessions/{flow['id']}/complete",
+        headers=rig.headers(),
+        json={"completion_code": flow["return"]["completion_code"], "label": "Work account"},
+    )
+    assert response.status_code == 200, response.text
+    conn = response.json()
+    assert rig.fake.headers  # Access was verified through MCP, without a userinfo request.
+    assert conn["provider_account_id"] is None and conn["display_name"] == "Work account"
+    assert not conn["reconnect_supported"]
+    session = await rig.session(conn)
+    await expire_credential(rig, conn["id"])
+    p = await rig.service.authenticate_session(session["token"])
+    credential, _ = await rig.service.credential(p, conn["id"])
+    assert credential.endswith("-new") and len(rig.fake.refreshes) == 1
+    updated = (await rig.http.get(f"/v1/connections/{conn['id']}", headers=rig.headers())).json()
+    assert updated["epoch"] == conn["epoch"] and updated["provider_account_id"] is None
+    denied = await rig.http.post(
+        "/v1/connect-sessions",
+        headers=rig.headers(),
+        json={
+            "integration_id": "records",
+            "return_url": RETURN,
+            "app_state": APP_STATE,
+            "reconnect_connection_id": conn["id"],
+        },
+    )
+    assert denied.status_code == 409 and denied.json()["error"]["code"] == "new_connection_required"
+    replacement = (await complete(rig, await stage(rig, code="bob"))).json()
+    assert replacement["id"] != conn["id"]
+    existing = (await rig.http.get(f"/v1/sessions/{session['id']}", headers=rig.headers())).json()
+    assert [c["id"] for c in existing["connections"]] == [conn["id"]]
+    async with rig.mcp(session) as client:
+        assert (await client.list_tools()).tools

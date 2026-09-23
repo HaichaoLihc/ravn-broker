@@ -101,22 +101,12 @@ class Store:
                 await self.db.execute("PRAGMA " + pragma)
             version = await one(self.db, "PRAGMA user_version")
             if version["user_version"] == 0:
-                migration = files("ravn").joinpath("migrations/001_initial.sql").read_text()
-                await self.db.executescript("BEGIN IMMEDIATE;\n" + migration + "\nCOMMIT;")
-            elif version["user_version"] not in {1, 2, 3, 4, 5}:
-                raise ValueError("Unsupported database schema version")
-            if version["user_version"] < 2:
-                migration = files("ravn").joinpath("migrations/002_console.sql").read_text()
-                await self.db.executescript("BEGIN IMMEDIATE;\n" + migration + "\nCOMMIT;")
-            if version["user_version"] < 3:
-                migration = files("ravn").joinpath("migrations/003_onboarding.sql").read_text()
-                await self.db.executescript("BEGIN IMMEDIATE;\n" + migration + "\nCOMMIT;")
-            if version["user_version"] < 4:
-                migration = files("ravn").joinpath("migrations/004_writes.sql").read_text()
-                await self.db.executescript("BEGIN IMMEDIATE;\n" + migration + "\nCOMMIT;")
-            if version["user_version"] < 5:
-                migration = files("ravn").joinpath("migrations/005_permissions.sql").read_text()
-                await self.db.executescript("BEGIN IMMEDIATE;\n" + migration + "\nCOMMIT;")
+                schema = files("ravn").joinpath("schema.sql").read_text()
+                await self.db.executescript("BEGIN IMMEDIATE;\n" + schema + "\nCOMMIT;")
+            elif version["user_version"] != 9:
+                raise ValueError(
+                    "Unsupported demo database layout; initialize a new state directory"
+                )
             async with self.transaction() as db:
                 check = await one(db, "SELECT value FROM metadata WHERE key='key-check'")
                 if check:
@@ -124,7 +114,9 @@ class Store:
                         raise ValueError("Key check failed")
                     key_id = await one(db, "SELECT value FROM metadata WHERE key='key-id'")
                     if key_id["value"] != self.cipher.key_id:
-                        raise ValueError("Key rotation requires a migration, not a config edit")
+                        raise ValueError(
+                            "Changing the key ID cannot rotate existing encrypted data"
+                        )
                 else:
                     await db.execute(
                         "INSERT INTO metadata VALUES('key-check',?)",
@@ -132,13 +124,6 @@ class Store:
                     )
                     await db.execute(
                         "INSERT INTO metadata VALUES('key-id',?)", (self.cipher.key_id,)
-                    )
-                for app in self.config.applications:
-                    old = await one(db, "SELECT * FROM applications WHERE id=?", (app.id,))
-                    if old and old["tenant_mode"] != app.tenant_mode:
-                        raise ValueError("Cannot change the tenant mode of an existing application")
-                    await db.execute(
-                        "INSERT OR IGNORE INTO applications VALUES(?,?)", (app.id, app.tenant_mode)
                     )
                 await db.execute(
                     "UPDATE calls SET status='unknown',error_code='outcome_unknown',"

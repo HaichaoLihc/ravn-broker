@@ -1,0 +1,19 @@
+{% macro icon(name) -%}<span class="icon icon-{{ name }}" aria-hidden="true"></span>{%- endmacro %}
+{% macro state(value) -%}
+{% set v = value or 'unknown' %}<span class="state {{ 'ok' if v in ['active','enabled','succeeded'] else 'risk' if v in ['failed','tool_error','denied'] else 'caution' if v in ['blocked','unknown','running','reconnect_required','reattach_required'] else 'neutral' }}">{{ v | replace('_',' ') }}</span>
+{%- endmacro %}
+{% macro value(v) -%}
+{% if v is none %}—{% elif v is string and v[4:5] == '-' and v[10:11] == 'T' %}<time datetime="{{ v }}">{{ v }}</time>{% else %}{{ v }}{% endif %}
+{%- endmacro %}
+{% macro facts(items) -%}<dl class="facts">{% for label, v in items %}<dt>{{ label }}</dt><dd>{{ value(v) }}</dd>{% endfor %}</dl>{%- endmacro %}
+{% macro field(name, label, value='', type='text', required=false, format='') -%}
+<label>{{ label }}<input name="{{ name }}" type="{{ type }}" value="{{ value }}" {% if required %}required{% endif %}
+{% if format %}data-format="{{ format }}"{% endif %} {% if type == 'password' %}autocomplete="new-password"{% endif %}></label>
+{%- endmacro %}
+{% macro action(endpoint, label, row={}, method='POST', confirm='', revision='', disabled=false) -%}
+<form class="action" action="/console/api/v1{{ endpoint }}" method="post" data-method="{{ method }}"
+{% if confirm %}data-confirm="{{ confirm }}" data-target="{{ row.get('id','') }}" data-user="{{ row.get('user_id','') }}"{% endif %} {% if revision %}data-revision="{{ revision }}"{% endif %}>
+{% for key in ['app_id','tenant_id'] if key in row %}<input type="hidden" name="{{ key }}" value="{{ row[key] }}">{% endfor %}
+{% if caller is defined %}{{ caller() }}{% endif %}
+<button class="button {{ 'danger' if confirm else '' }}" {% if disabled %}disabled{% endif %}>{{ label }}</button></form>
+{%- endmacro %}

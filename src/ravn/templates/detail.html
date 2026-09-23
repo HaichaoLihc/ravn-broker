@@ -1,0 +1,46 @@
+<aside class="drawer" aria-labelledby="detail-title" tabindex="-1" data-close-url="{{ back_url }}">
+<header><div><h2 id="detail-title">{{ detail.display_name if view == 'connections' else detail.tool if view == 'calls' else detail.kind | replace('.',' · ') if view == 'events' else detail.label if view == 'app-keys' else 'Runtime session' }}</h2><button class="copy-id" data-copy="{{ detail.id }}" title="Copy ID">{{ detail.id }} {{ icon('copy') }}</button></div><a class="icon-button" href="{{ back_url }}" aria-label="Close">{{ icon('x') }}</a></header>
+<div class="drawer-body"><div class="detail-content">
+{{ facts([('Application',detail.app_id),('Tenant',detail.get('tenant_id')),('User',detail.get('user_id')),('Created',detail.created_at)]) }}
+{% if view == 'connections' %}
+<h2>Connection</h2>{{ facts([('Integration',detail.integration_id),('Provider account',detail.provider_account_id),('Authentication','OAuth · managed refresh when issued' if detail.credential_type == 'oauth2' else 'Imported user token'),('Saved state',detail.status),('Broker access',detail.broker_access),('Credential version',detail.credential_version),('Revision',detail.revision)]) }}
+<p class="muted">Saved credentials do not prove current provider access. Provider credentials are never displayed.</p>
+{% if detail.status == 'reconnect_required' %}<p class="muted">{{ 'Authorize the same account again' if detail.reconnect_supported else 'Create a new connection; this service does not verify account identity' }} through your backend, or use:</p><code class="command">ravn connections connect --integration {{ detail.integration_id }} {% if detail.reconnect_supported %}--reconnect {{ detail.id }} {% endif %}--app-key-file … --user …</code><p class="muted">Then explicitly attach {{ 'this account again' if detail.reconnect_supported else 'the new connection' }} to the sessions that should use it.</p>{% endif %}
+<div class="button-row"><a class="button" href="{{ url(view='sessions',app_id=app_id,tenant_id=detail.tenant_id,connection_id=detail.id) }}">View sessions</a><a class="button" href="{{ url(view='calls',app_id=app_id,tenant_id=detail.tenant_id,connection_id=detail.id) }}">View calls</a><a class="button" href="{{ url(**dict(query,map=None if related else '1')) }}" aria-expanded="{{ 'true' if related else 'false' }}">Access map</a></div>
+{% if related %}
+<section><h2>Access map</h2><div class="access-map">
+{% set height = [220, related.data | length * 60 + 40] | max %}
+<svg viewBox="0 0 740 {{ height }}" role="img" aria-label="Connection owner and attached sessions">
+<title>{{ detail.user_id }} owns {{ detail.display_name }}; {{ related.data | length }} sessions shown</title>
+<path class="graph-edge" d="M180 {{ height/2 }} C270 {{ height/2 }},470 {{ height/2 }},555 {{ height/2 }}"/>
+{% for s in related.data %}{% set y = loop.index0 * 60 + 40 %}<path class="graph-edge" d="M465 {{ y }} C510 {{ y }},510 {{ height/2 }},555 {{ height/2 }}"/>{% endfor %}
+<g class="graph-node"><rect x="10" y="{{ height/2 - 25 }}" width="170" height="50" rx="4"/><text x="22" y="{{ height/2 - 3 }}">{{ detail.user_id[:22] }}</text><text class="graph-note" x="22" y="{{ height/2 + 14 }}">Connection owner</text></g>
+{% for s in related.data %}{% set y = loop.index0 * 60 + 15 %}{% set attachment = (s.connections | selectattr('id','equalto',detail.id) | list)[0] %}
+<a href="{{ url(view='sessions',app_id=app_id,tenant_id=s.tenant_id,id=s.id) }}" aria-label="Open session {{ s.id }}"><g class="graph-node"><title>{{ s.id }} · {{ attachment.blocked_reason or s.status }}</title><rect x="275" y="{{ y }}" width="190" height="50" rx="4"/><text x="287" y="{{ y+20 }}">{{ s.id[:18] }}…</text><text class="graph-note" x="287" y="{{ y+37 }}">{{ (attachment.blocked_reason or s.status) | replace('_',' ') }}</text></g></a>{% endfor %}
+<g class="graph-node"><rect x="555" y="{{ height/2-25 }}" width="175" height="50" rx="4"/><text x="567" y="{{ height/2-3 }}">{{ detail.display_name[:20] }}</text><text class="graph-note" x="567" y="{{ height/2+14 }}">{{ detail.integration_id[:22] }}</text></g>
+</svg></div><p class="muted">Showing up to 10 sessions and their connection bindings. Use View sessions for the full list.</p></section>{% endif %}
+{% elif view == 'sessions' %}
+<h2>Runtime access</h2>{{ facts([('Connections',detail.connections | length),('Token state',detail.status),('Broker access',detail.broker_access),('Blocked reason',detail.blocked_reason),('Expires',detail.expires_at),('Revoked',detail.revoked_at)]) }}
+<p class="muted">{% if detail.status == 'active' %}This token can access the attached accounts. Revoke the session to stop new calls across all its connections.{% else %}This session no longer accepts tool calls.{% endif %}</p>
+<section class="session-connections"><h2>Attached connections</h2><p class="muted">Each connection keeps its provider permissions. Adding or removing one keeps this session's token and expiry. Refresh the agent's tool list after changes.</p>
+{% for c in detail.connections %}<article><strong>{{ c.display_name }} · {{ c.integration_id }}</strong><code>{{ c.id }}</code><span class="muted">{{ (c.blocked_reason or 'Available') | replace('_',' ') }}</span><div class="button-row">
+{% if c.blocked_reason == 'reattach_required' %}{{ action('/sessions/' + detail.id + '/connections/' + c.id,'Reattach current authorization',detail,method='PUT',disabled=detail.status != 'active') }}{% endif %}
+{{ action('/sessions/' + detail.id + '/connections/' + c.id,'Remove',detail,method='DELETE',disabled=detail.status != 'active') }}</div></article>{% else %}<p class="muted">No connections attached. This session has no tools.</p>{% endfor %}
+{% if choices %}{% call action('/sessions/' + detail.id + '/connections/{connection}','Attach connection',detail,method='PUT',disabled=detail.connections | length >= 8 or not choices.data) %}
+<label>Add connection<select name="_connection" required><option value="">Choose an existing account</option>{% for c in choices.data %}<option value="{{ c.id }}">{{ c.display_name }} · {{ c.integration_id }} · {{ c.id }}</option>{% endfor %}</select></label>{% endcall %}
+{% if choices.next_cursor %}<a href="{{ url(**dict(query,connection_cursor=choices.next_cursor)) }}">More accounts</a>{% endif %}{% endif %}
+<p class="muted">Up to 8 connections, all owned by this session's user. Removing a connection here leaves the saved account and other sessions intact.</p></section>
+<div><a class="button" href="{{ url(view='calls',app_id=app_id,tenant_id=detail.tenant_id,session_id=detail.id) }}">View calls</a></div>
+{% elif view == 'calls' %}
+<h2>Recorded outcome</h2>{{ state(detail.status) }}
+{% if detail.status == 'unknown' %}<p class="muted">This operation may have run at the provider. RAVN never retries it; check the provider before trying again.</p>{% endif %}
+{{ facts([('Tool',detail.tool),('Effect','Read' if detail.effect == 'read' else 'Write (never retried)' if detail.effect == 'write' else 'Provider-defined'),('Connection',detail.connection_id),('Session',detail.session_id),('Duration',(detail.duration_ms | string) + ' ms' if detail.duration_ms is not none else none),('Error code',detail.error_code),('Completed',detail.completed_at),('Argument fingerprint',detail.arguments_fingerprint)]) }}
+<p class="muted">Metadata only. Raw arguments and results are not retained.</p>
+{% elif view == 'events' %}{{ facts([('Event',detail.kind),('Actor category',detail.actor_kind),('Actor ID',detail.actor_id),('Subject',detail.subject_id),('Request ID',detail.request_id)]) }}
+{% elif view == 'app-keys' %}{{ facts([('Key state','revoked' if detail.revoked_at else 'active'),('Revoked',detail.revoked_at)]) }}<p class="muted">Only metadata is available. Generate a replacement from Application keys or the owner-only CLI.</p><code class="command">ravn app-key create --app {{ app_id }} --output /private/path/backend.key</code>{% endif %}
+</div></div>
+<footer>
+{% if view == 'connections' %}{{ action('/connections/' + detail.id + '/disconnect','Disconnect',detail,revision='"' + (detail.revision | string) + '"',disabled=detail.status == 'disconnected',confirm='Disconnect this account? Its sessions lose access to this connection. RAVN deletes its credential copy; it does not revoke the provider token. Other connections remain available.') }}
+{% elif view == 'sessions' %}{{ action('/sessions/' + detail.id + '/revoke','Revoke session',detail,disabled=detail.status != 'active',confirm='Revoke this runtime session? Other sessions and the saved connections remain unchanged.') }}
+{% elif view == 'app-keys' %}{% call action('/app-keys/' + detail.id + '/revoke','Revoke key',detail,confirm='Revoke this application key? The backend will no longer be able to use it. Existing runtime sessions survive unless selected below.') %}<input type="hidden" name="revoke_sessions" value="false" data-format="json">{% endcall %}{% endif %}
+<a class="button" href="{{ back_url }}">Close</a></footer></aside>

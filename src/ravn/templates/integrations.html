@@ -1,0 +1,45 @@
+<p class="muted">Register a remote MCP service once. Users connect their own accounts through your application or the CLI.</p>
+{% for item in boot.integrations if item.app_id == app_id %}
+<section><h2>{{ item.id }} <span class="badge">{{ 'Enabled' if item.enabled else 'Disabled' }}</span></h2>
+  <dl><dt>MCP endpoint</dt><dd>{{ item.endpoint }}</dd><dt>Authentication</dt><dd>{{ 'OAuth' if item.oauth_configured else 'Bearer token import' }}</dd>
+    {% if item.callback_url %}<dt>Callback URL</dt><dd>{{ item.callback_url }}</dd>{% endif %}
+    <dt>Permissions</dt><dd>Inherited from the connected account</dd></dl>
+  {{ action('/integrations/' + app_id + '/' + item.id + '/disable', 'Disable integration', disabled=not item.enabled, confirm='Disable this integration? Its accounts will stop accepting new calls. Other integrations remain available. To replace it, register a new ID.') }}
+</section>
+{% else %}<section><p>No integrations registered for this application.</p></section>{% endfor %}
+{% if app_enabled %}<details class="panel"><summary>Add integration</summary>
+  <form id="integration-form" action="/console/api/v1/integrations" method="post" data-method="POST" class="integration" data-callback="{{ boot.public_url }}/oauth/callback/{{ app_id }}/">
+    <input type="hidden" name="app_id" value="{{ app_id }}">
+    <p>Start with the service address. RAVN reads its published authorization settings.</p>
+    <div class="fields">{{ field('id', 'Integration ID', required=true) }}{{ field('endpoint', 'MCP endpoint', type='url', required=true) }}</div>
+    <div class="setup-actions"><button type="button" id="discover-integration" class="button">Read service settings</button><button type="button" id="manual-integration" class="button">Configure manually</button></div>
+    <p id="discovery-status" role="status" aria-live="polite"></p>
+    <fieldset id="integration-settings" hidden disabled><legend>Connect accounts</legend>
+      <label>Authentication<select id="integration-auth"><option value="oauth">OAuth — users approve access in their browser</option><option value="bearer">Bearer token — import an existing access token</option></select></label>
+      <p id="bearer-help" class="muted" hidden>Save this service, then import a token through your backend or <code>ravn connections import</code>. RAVN verifies access to the MCP service; no account identity endpoint is required.</p>
+      <fieldset id="oauth-fields"><legend>OAuth application</legend>
+        <p class="muted">Register an application with the service and enter its client credentials. This version uses pre-registered applications.</p>
+        <div class="fields">{{ field('oauth.client_id', 'Client ID', required=true) }}{{ field('oauth.client_secret', 'Client secret', type='password', required=true) }}</div>
+        <p>Copy this callback URL into your provider application's redirect URLs:</p>
+        <code id="integration-callback">Enter an Integration ID above.</code>
+        <p class="muted">The client secret is encrypted when saved and never displayed again.</p>
+        <label>Requested permissions (space-separated provider scopes)<input name="oauth.scopes" data-format="words" autocomplete="off"></label>
+        <div id="scope-choices" class="scope-choices" aria-label="Available permissions"></div>
+        <p class="muted">Select only the permissions you need. If the service does not publish a list, use the scope names from its documentation.</p>
+        <details id="oauth-options"><summary>OAuth settings</summary>
+          <p class="muted">Filled automatically when discovery succeeds. Manual setup requires authorization code with S256 PKCE and Bearer access tokens.</p>
+          <div class="fields">
+            {{ field('oauth.authorization_endpoint', 'Authorization URL — where users approve access', type='url', required=true) }}
+            {{ field('oauth.token_endpoint', 'Token URL — where RAVN obtains credentials', type='url', required=true) }}
+            {{ field('oauth.issuer', 'Authorization server identifier', type='url', required=true) }}
+            {{ field('oauth.resource', 'Resource URL (optional)', type='url') }}
+          </div>
+          <label>Client authentication<select name="oauth.token_endpoint_auth_method"><option value="client_secret_post">Client secret in request body</option><option value="client_secret_basic">HTTP Basic authentication</option><option value="none">Public client — no client secret</option></select></label>
+          {{ field('oauth.authorization_params', 'Extra authorization parameters (JSON)', '{}', format='json') }}
+          <label class="check"><input type="checkbox" name="oauth.rotating_refresh_tokens"> Require a new refresh token on each refresh</label>
+        </details>
+      </fieldset>
+      <button type="submit" class="button primary">Register integration</button>
+    </fieldset>
+  </form>
+</details>{% endif %}

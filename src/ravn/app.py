@@ -8,16 +8,18 @@ from urllib.parse import urlsplit
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
-from mcp import types
 from mcp.server import Server
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.shared.exceptions import MCPError
 from pydantic import Field, SecretStr
 from starlette.responses import JSONResponse, RedirectResponse
 
+from ravn.applications import add_application_routes
+from ravn.catalogue import tool_connection
 from ravn.common import RavnError, identifier, strict_json
 from ravn.config import Config, Model
-from ravn.service import Service
+from ravn.integrations import add_integration_routes
+from ravn.service import MAX_SESSION_CONNECTIONS, Service
 
 BODY_READ_TIMEOUT_SECONDS = 10
 IDEMPOTENCY = re.compile(r"[A-Za-z0-9._:-]{8,128}")
@@ -35,9 +37,8 @@ class ImportRequest(Model):
 
 
 class SessionRequest(Model):
-    connection_id: str = Field(min_length=8, max_length=128)
+    connection_ids: list[str] = Field(default_factory=list, max_length=MAX_SESSION_CONNECTIONS)
     ttl_seconds: int | None = Field(default=None, strict=True, ge=60, le=14400)
-    restrictions: dict | None = None
 
 
 class ConnectRequest(Model):
@@ -49,11 +50,7 @@ class ConnectRequest(Model):
 
 class CompleteRequest(Model):
     completion_code: SecretStr = Field(min_length=32, max_length=512)
-
-
-class KeyRequest(Model):
-    app_id: str = Field(min_length=1, max_length=64)
-    label: str = Field(min_length=1, max_length=128)
+    label: str | None = Field(default=None, min_length=1, max_length=128)
 
 
 class RevokeKeyRequest(Model):
@@ -277,10 +274,10 @@ def create_app(config: Config, *, provider=None) -> FastAPI:
         try:
             if params and params.cursor:
                 raise RavnError(
-                    400, "invalid_cursor", "The reviewed catalogue has no continuation cursor."
+                    400, "invalid_cursor", "The broker catalogue has no continuation cursor."
                 )
             p = principal(ctx)
-            return types.ListToolsResult(tools=await service.discover(p, p.connection_id))
+            return await service.session_tools(p)
         except RavnError as error:
             raise MCPError(
                 -32000, error.message, error.envelope(ctx.request.state.request_id)["error"]
@@ -292,7 +289,7 @@ def create_app(config: Config, *, provider=None) -> FastAPI:
                 raise RavnError(
                     400,
                     "unsupported_upstream_interaction",
-                    "Only synchronous read calls are supported.",
+                    "Only synchronous tool calls are supported.",
                 )
             # A RAVN extension consumed here; providers only ever receive arguments.
             key = (params.meta or {}).get("ravn/idempotency-key")
@@ -301,11 +298,12 @@ def create_app(config: Config, *, provider=None) -> FastAPI:
             p = principal(ctx)
             return await service.execute(
                 p,
-                p.connection_id,
+                tool_connection(params.name),
                 params.name,
                 params.arguments or {},
                 ctx.request.state.request_id,
                 idempotency_key=key,
+                routed=True,
             )
         except RavnError as error:
             raise MCPError(
@@ -377,7 +375,7 @@ def create_app(config: Config, *, provider=None) -> FastAPI:
     @app.post("/v1/connect-sessions/{sid}/complete")
     async def complete_connect(request: Request, sid: str, body: CompleteRequest):
         return await service.oauth.complete(
-            request.state.principal, sid, body.completion_code.get_secret_value()
+            request.state.principal, sid, body.completion_code.get_secret_value(), body.label
         )
 
     @app.post("/v1/connect-sessions/{sid}/cancel")
@@ -451,12 +449,8 @@ def create_app(config: Config, *, provider=None) -> FastAPI:
 
     @app.post("/v1/sessions", status_code=201)
     async def create_session(request: Request, body: SessionRequest):
-        if body.restrictions is not None:
-            raise RavnError(
-                422, "unsupported_constraint", "Fine-grained restrictions are not implemented."
-            )
         return await service.create_session(
-            request.state.principal, body.connection_id, body.ttl_seconds
+            request.state.principal, body.connection_ids, body.ttl_seconds
         )
 
     @app.get("/v1/sessions")
@@ -472,6 +466,22 @@ def create_app(config: Config, *, provider=None) -> FastAPI:
     async def revoke_session(request: Request, session_id: str):
         return await service.revoke_session(request.state.principal, session_id)
 
+    @app.get("/v1/sessions/{session_id}")
+    async def session(session_id: str, request: Request):
+        return await service.session(request.state.principal, session_id)
+
+    @app.api_route(
+        "/v1/sessions/{session_id}/connections/{connection_id}", methods=["PUT", "DELETE"]
+    )
+    async def session_connection(session_id: str, connection_id: str, request: Request):
+        return await service.set_session_connection(
+            request.state.principal,
+            session_id,
+            connection_id,
+            request.method == "PUT",
+            request.state.request_id,
+        )
+
     @app.get("/v1/calls/{call_id}")
     async def call_status(request: Request, call_id: str):
         return await service.call_status(request.state.principal, call_id)
@@ -485,16 +495,14 @@ def create_admin_app(service: Service, console=None) -> FastAPI:
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
     app.add_middleware(Boundary, service=service, admin=True)
     attach_errors(app)
+    add_integration_routes(app, "/admin/v1", service)
+    add_application_routes(app, "/admin/v1", service)
 
     @app.post("/admin/v1/console-tickets", status_code=201)
     async def console_ticket():
         if console is None:
             raise RavnError(404, "not_found", "Console is disabled. Start ravn serve --console.")
         return console.ticket()
-
-    @app.post("/admin/v1/app-keys", status_code=201)
-    async def create_key(body: KeyRequest):
-        return await service.create_key(body.app_id, body.label)
 
     @app.post("/admin/v1/app-keys/{key_id}/revoke")
     async def revoke_key(key_id: str, body: RevokeKeyRequest):

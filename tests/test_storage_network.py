@@ -1,26 +1,69 @@
 import asyncio
 import base64
+import json
 from unittest.mock import AsyncMock
 
 import httpx2
 import pytest
+from conftest import add_application
 from cryptography.exceptions import InvalidTag
 
 from ravn.common import RavnError
 from ravn.crypto import Cipher
-from ravn.github import BoundedStream, GitHub, PinnedTransport
+from ravn.integrations import IntegrationRegistration as Integration
+from ravn.provider import BoundedStream, PinnedTransport, RemoteMCP
 from ravn.service import Service
 from ravn.store import one
 
 pytestmark = pytest.mark.anyio
 
 
-@pytest.mark.parametrize("login", ["credential-echo", "evil\nname", "x" * 40])
+@pytest.mark.parametrize("rpc_code", [-32600, -32602])
+async def test_mcp_failure_diagnostics_do_not_log_peer_payloads(caplog, rpc_code):
+    def upstream(request):
+        message = json.loads(request.content)
+        return httpx2.Response(
+            400,
+            json={
+                "jsonrpc": "2.0",
+                "id": message["id"],
+                "error": {
+                    "code": rpc_code,
+                    "message": "MCP access disabled: SECRET",
+                    "data": "SECRET",
+                },
+            },
+        )
+
+    provider = RemoteMCP(
+        Integration(id="test", app_id="demo", endpoint="https://mcp.example/mcp"),
+        transport_factory=lambda _: httpx2.MockTransport(upstream),
+    )
+    with pytest.raises(RavnError) as error:
+        await provider.discover("SECRET", provider.integration)
+    assert error.value.code == "provider_protocol_error"
+    assert str(rpc_code) in error.value.message
+    assert "SECRET" not in error.value.message
+    assert f"MCPError({rpc_code})" in caplog.text
+    assert "SECRET" not in caplog.text
+
+
+@pytest.mark.parametrize("login", ["credential-echo", "evil\nname", "x" * 256])
 async def test_provider_identity_cannot_echo_secret_into_metadata(login):
-    provider = GitHub(
+    provider = RemoteMCP(
+        Integration(
+            id="test",
+            app_id="demo",
+            endpoint="https://mcp.records.example/mcp/",
+            identity={
+                "endpoint": "https://identity.records.example/user",
+                "id_field": "id",
+                "display_field": "login",
+            },
+        ),
         transport_factory=lambda host: httpx2.MockTransport(
             lambda request: httpx2.Response(200, json={"id": 1, "login": login})
-        )
+        ),
     )
     with pytest.raises(RavnError) as error:
         await provider.identify("credential-echo")
@@ -31,6 +74,7 @@ async def test_provider_identity_cannot_echo_secret_into_metadata(login):
 async def test_second_server_refused_and_restart_preserves_data(config):
     first = Service(config)
     await first.start()
+    await add_application(first)
     key = await first.create_key("demo", "backend")
     second = Service(config)
     try:
@@ -131,6 +175,7 @@ async def test_transactions_do_not_interleave(config):
 async def test_restart_does_not_redispatch_running_call(config):
     service = Service(config)
     await service.start()
+    await add_application(service)
     async with service.store.transaction() as db:
         await db.execute(
             "INSERT INTO connections(id,app_id,tenant_id,user_id,integration_id,provider_account_id,display_name,label,status,epoch,revision,ciphertext,key_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -139,7 +184,7 @@ async def test_restart_does_not_redispatch_running_call(config):
                 "demo",
                 "default",
                 "alice",
-                "github",
+                "records",
                 "123",
                 "Alice",
                 None,
@@ -187,14 +232,14 @@ async def test_restart_does_not_redispatch_running_call(config):
 @pytest.mark.parametrize(
     "url",
     [
-        "http://api.github.com/user",
+        "http://identity.records.example/user",
         "https://evil.example/user",
-        "https://api.github.com:444/user",
-        "https://user:pass@api.github.com/user",
+        "https://identity.records.example:444/user",
+        "https://user:pass@identity.records.example/user",
     ],
 )
 async def test_outbound_origin_restrictions(url):
-    transport = PinnedTransport("api.github.com", 1024)
+    transport = PinnedTransport("identity.records.example", 1024)
     try:
         with pytest.raises(RavnError):
             await transport.handle_async_request(httpx2.Request("GET", url))
@@ -208,11 +253,11 @@ async def test_dns_private_addresses_rejected(monkeypatch, ip):
     monkeypatch.setattr(
         loop, "getaddrinfo", AsyncMock(return_value=[(None, None, None, None, (ip, 443))])
     )
-    transport = PinnedTransport("api.github.com", 1024)
+    transport = PinnedTransport("identity.records.example", 1024)
     try:
         with pytest.raises(RavnError):
             await transport.handle_async_request(
-                httpx2.Request("GET", "https://api.github.com/user")
+                httpx2.Request("GET", "https://identity.records.example/user")
             )
     finally:
         await transport.aclose()
@@ -229,15 +274,15 @@ async def test_dns_ip_pinning_preserves_host_and_tls_name(monkeypatch):
         seen.append(request)
         return httpx2.Response(200, content=b"ok")
 
-    transport = PinnedTransport("api.github.com", 1024)
+    transport = PinnedTransport("identity.records.example", 1024)
     await transport.inner.aclose()
     transport.inner = httpx2.MockTransport(upstream)
     response = await transport.handle_async_request(
-        httpx2.Request("GET", "https://api.github.com/user")
+        httpx2.Request("GET", "https://identity.records.example/user")
     )
     assert seen[0].url.host == "8.8.8.8"
-    assert seen[0].headers["host"] == "api.github.com"
-    assert seen[0].extensions["sni_hostname"] == "api.github.com"
+    assert seen[0].headers["host"] == "identity.records.example"
+    assert seen[0].extensions["sni_hostname"] == "identity.records.example"
     await response.aclose()
     await transport.aclose()
 
@@ -247,13 +292,15 @@ async def test_provider_redirect_not_followed(monkeypatch):
     monkeypatch.setattr(
         loop, "getaddrinfo", AsyncMock(return_value=[(None, None, None, None, ("8.8.8.8", 443))])
     )
-    transport = PinnedTransport("api.github.com", 1024)
+    transport = PinnedTransport("identity.records.example", 1024)
     await transport.inner.aclose()
     transport.inner = httpx2.MockTransport(
         lambda _: httpx2.Response(302, headers={"Location": "https://evil.example"})
     )
     with pytest.raises(RavnError):
-        await transport.handle_async_request(httpx2.Request("GET", "https://api.github.com/user"))
+        await transport.handle_async_request(
+            httpx2.Request("GET", "https://identity.records.example/user")
+        )
     await transport.aclose()
 
 

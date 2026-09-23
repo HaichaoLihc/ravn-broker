@@ -1,4 +1,4 @@
-"""A real local CLI process/HTTP/Unix-socket smoke test; never contacts GitHub."""
+"""A real local CLI process/HTTP/Unix-socket smoke test; never contacts a provider."""
 
 import json
 import os
@@ -13,6 +13,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+import yaml
 
 
 def cli(*args):
@@ -39,6 +40,7 @@ def test_cli_init_serve_admin_and_backend(with_console):
         cli("init", "--directory", root, "--port", port)
         config = root / "ravn.yaml"
         cli("config-check", "--config", config)
+        assert not {"applications", "integrations"} & yaml.safe_load(config.read_text()).keys()
         process = subprocess.Popen(
             [sys.executable, "-m", "ravn.cli", "serve", "--config", str(config)]
             + (["--console", "--console-port", str(console_port)] if with_console else []),
@@ -64,6 +66,7 @@ def test_cli_init_serve_admin_and_backend(with_console):
                     assert time.monotonic() < deadline, "CLI server did not become ready"
                     time.sleep(0.05)
 
+                cli("application", "create", "--config", config, "--id", "demo")
                 key_file = root / "backend.key"
                 cli("app-key", "create", "--config", config, "--app", "demo", "--output", key_file)
                 secret = key_file.read_text().strip()

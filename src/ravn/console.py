@@ -1,35 +1,27 @@
 """Optional local-owner console. No application key or runtime token grants access."""
 
 import hmac
-import json
 import re
 import secrets
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 
 from fastapi import FastAPI, Request
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
+from fastapi.responses import JSONResponse
 from pydantic import Field
-from starlette.staticfiles import StaticFiles
 
 from ravn import control
 from ravn.app import Boundary, attach_errors, error_response
+from ravn.applications import add_application_routes
 from ravn.common import RavnError, digest, identifier, now
 from ravn.config import Model
-from ravn.manifest import is_write, schemas_for
-from ravn.permissions import effective_tools, session_rules
-from ravn.service import ACTOR, public_connection, public_session
+from ravn.integrations import add_integration_routes
+from ravn.service import ACTOR, public_connection
 from ravn.store import event, one, rows
 
 PREFIX = "/console/api/v1"
 COOKIE = "ravn_operator"
-STATIC = Path(__file__).parent / "static" / "console"
-
-
-def effect_of(integration, name: str) -> str:
-    return "write" if integration and is_write(name, integration.connector) else "read"
 
 
 @dataclass(frozen=True)
@@ -53,13 +45,6 @@ class TargetRequest(Model):
 class KeyTarget(Model):
     app_id: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$")
     revoke_sessions: bool = Field(default=False, strict=True)
-
-
-class PermissionRequest(Model):
-    app_id: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$")
-    tenant_id: str = Field(pattern=ACTOR.pattern)
-    # Tool name to allowed. Only names already in the session's ceiling are accepted.
-    tools: dict[str, bool] = Field(min_length=1, max_length=64)
 
 
 def invalid(message="Invalid console request."):
@@ -157,53 +142,36 @@ class Console:
                 request_id=request_id,
             )
 
-    async def bootstrap(self, p):
+    async def bootstrap(self, p, *, include_counts=False):
         async with self.service.store.transaction() as db:
             self.ensure(p)
-            apps = await rows(db, "SELECT * FROM applications ORDER BY id")
+            if include_counts:
+                apps = await rows(
+                    db,
+                    """SELECT a.*,
+                        (SELECT COUNT(*) FROM integrations WHERE app_id=a.id) AS integration_count,
+                        (SELECT COUNT(*) FROM connections WHERE app_id=a.id) AS connection_count,
+                        (SELECT COUNT(*) FROM sessions WHERE app_id=a.id
+                            AND revoked_at IS NULL AND expires_at>?) AS active_session_count
+                        FROM applications a ORDER BY a.id""",
+                    (now(),),
+                )
+            else:
+                apps = await rows(db, "SELECT * FROM applications ORDER BY id")
         cfg = self.service.config
         for app in apps:
-            configured = next((a for a in cfg.applications if a.id == app["id"]), None)
-            app["enabled"] = bool(configured and configured.enabled)
-            app["configured"] = configured is not None
+            app.update(self.service.applications.items[app["id"]].model_dump(mode="json"))
         return {
             "deployment_id": cfg.deployment_id,
+            "public_url": cfg.server.public_url.rstrip("/"),
             "version": "0.1.0.dev0",
             "ready": self.service.ready,
             "applications": apps,
             "sessions": cfg.sessions.model_dump(),
-            "integrations": [
-                {
-                    "app_id": i.app_id,
-                    "id": i.id,
-                    "enabled": i.enabled,
-                    "endpoint": i.endpoint,
-                    "schema_hashes": i.schema_hashes,
-                    "reviewed_tools": [n for n in schemas_for(i.connector) if n in i.schema_hashes],
-                    "tools": [
-                        {"name": n, "effect": effect_of(i, n)}
-                        for n in schemas_for(i.connector)
-                        if n in i.schema_hashes
-                    ],
-                    "connector": i.connector,
-                    "oauth_configured": i.oauth is not None,
-                    "oauth_profile": i.oauth.profile if i.oauth else None,
-                    "callback_url": cfg.server.public_url.rstrip("/")
-                    + f"/oauth/callback/{i.app_id}/{i.id}"
-                    if i.oauth
-                    else None,
-                }
-                for i in cfg.integrations
-            ],
+            "integrations": self.service.integrations.listing(),
             "features": {
                 "oauth": True,
-                # A reviewed write tool is pinned somewhere, so the console must not
-                # keep claiming writes are unavailable.
-                "writes": any(
-                    effect_of(i, n) == "write" for i in cfg.integrations for n in i.schema_hashes
-                ),
                 "scope_editing": False,
-                "session_permissions": True,
                 "live_provider_verified": False,
             },
         }
@@ -211,9 +179,9 @@ class Console:
     async def project(self, db, table, row):
         namespace = {k: row[k] for k in ("app_id", "tenant_id", "user_id") if k in row}
         if table == "connections":
-            integration = self.service.config.integration(row["app_id"], row["integration_id"])
+            integration = self.service.integrations.get(row["app_id"], row["integration_id"])
             enabled = (
-                self.service.config.app(row["app_id"]) is not None
+                self.service.applications.get(row["app_id"]) is not None
                 and integration
                 and integration.enabled
             )
@@ -225,53 +193,23 @@ class Console:
                 "verified_at_import": row["created_at"],
             }
         if table == "sessions":
-            conn = await one(
-                db,
-                "SELECT * FROM connections WHERE app_id=? AND tenant_id=? AND id=?",
-                (row["app_id"], row["tenant_id"], row["connection_id"]),
-            )
-            integration = (
-                self.service.config.integration(row["app_id"], conn["integration_id"])
-                if conn
-                else None
-            )
-            ceiling = json.loads(row["tools"])
-            pinned = [
-                n
-                for n, pin in ceiling.items()
-                if integration and integration.schema_hashes.get(n) == pin
-            ]
-            rules = await session_rules(db, row["app_id"], row["tenant_id"], row["id"])
-            current = effective_tools(ceiling, integration, rules)
-            status = public_session(row)
+            value = await self.service.session_view(db, row)
             reason = None
-            if status["status"] != "active":
-                reason = status["status"]
-            elif not conn or conn["status"] != "active" or conn["epoch"] != row["connection_epoch"]:
-                reason = "connection_disabled"
-            elif (
-                not self.service.config.app(row["app_id"])
-                or not integration
-                or not integration.enabled
-            ):
-                reason = "integration_disabled"
-            elif not pinned:
-                reason = "no_reviewed_tools"
-            elif not current:
-                reason = "all_tools_denied"
-            return {
-                **status,
-                **namespace,
-                "tools": sorted(ceiling),
-                "current_tools": current if reason is None else [],
-                # Every name the operator may toggle, with its present decision.
-                "permissions": [
-                    {"name": n, "allowed": rules.get(n, True), "effect": effect_of(integration, n)}
-                    for n in sorted(pinned)
-                ],
-                "blocked_reason": reason,
-                "broker_access": "enabled" if reason is None else "blocked",
-            }
+            if value["status"] != "active":
+                reason = value["status"]
+            elif not self.service.applications.get(row["app_id"]):
+                reason = "application_disabled"
+            elif not any(c["blocked_reason"] is None for c in value["connections"]):
+                reason = "no_usable_connections"
+            return (
+                value
+                | namespace
+                | {
+                    "access_policy": "connection",
+                    "blocked_reason": reason,
+                    "broker_access": "enabled" if reason is None else "blocked",
+                }
+            )
         if table == "calls":
             return {
                 k: row[k]
@@ -387,6 +325,9 @@ class Console:
             if table == "sessions" and field == "status":
                 sql += " AND (CASE WHEN revoked_at IS NOT NULL THEN 'revoked' WHEN expires_at<=? THEN 'expired' ELSE 'active' END)=?"
                 params.extend([cutoff, query[field]])
+            elif table == "sessions" and field == "connection_id":
+                sql += " AND EXISTS (SELECT 1 FROM session_connections sc WHERE sc.app_id=sessions.app_id AND sc.tenant_id=sessions.tenant_id AND sc.session_id=sessions.id AND sc.connection_id=?)"
+                params.append(query[field])
             else:
                 sql += f" AND {field}=?"
                 params.append(query[field])
@@ -460,54 +401,27 @@ class Console:
                 await control.revoke_key(db, target, row, revoke_sessions, **audit)
         return {"id": identity, "committed": True}
 
-    async def set_permissions(self, p, identity, app, tenant, tools, request_id):
+    async def session_connection(self, p, sid, cid, app, tenant, attach, request_id):
+        self.validate_namespace(app, tenant)
         async with self.service.store.transaction() as db:
             self.ensure(p)
             row = await one(
                 db,
-                "SELECT * FROM sessions WHERE id=? AND app_id=? AND tenant_id=?",
-                (identity, app, tenant),
+                "SELECT * FROM sessions WHERE app_id=? AND tenant_id=? AND id=?",
+                (app, tenant, sid),
             )
             if row is None:
-                raise RavnError(404, "not_found", "Record not found in this namespace.")
-            conn = await one(
+                raise RavnError(404, "not_found", "Session not found in this namespace.")
+            await self.service.change_attachment(
                 db,
-                "SELECT * FROM connections WHERE app_id=? AND tenant_id=? AND id=?",
-                (app, tenant, row["connection_id"]),
-            )
-            integration = (
-                self.service.config.integration(app, conn["integration_id"]) if conn else None
-            )
-            ceiling = json.loads(row["tools"])
-            # Refuse names this session could never call, so a stale page cannot
-            # look like it granted something.
-            unknown = sorted(set(tools) - set(ceiling))
-            if unknown:
-                raise RavnError(
-                    422,
-                    "invalid_request",
-                    "These tools are outside this session's ceiling: " + ", ".join(unknown),
-                )
-            target = control.AuditTarget(app, row["tenant_id"], row["user_id"])
-            await control.set_permissions(
-                db,
-                target,
                 row,
-                tools,
+                cid,
+                attach,
                 actor_kind="local_operator",
                 actor_id=p.id,
                 request_id=request_id,
             )
-            rules = await session_rules(db, app, tenant, identity)
-            return {
-                "id": identity,
-                "committed": True,
-                "permissions": [
-                    {"name": n, "allowed": rules.get(n, True), "effect": effect_of(integration, n)}
-                    for n in sorted(ceiling)
-                    if integration and integration.schema_hashes.get(n) == ceiling[n]
-                ],
-            }
+            return await self.project(db, "sessions", row)
 
 
 class ConsoleBoundary:
@@ -536,7 +450,8 @@ class ConsoleBoundary:
                     403, "permission_denied", "Cross-origin console requests are forbidden."
                 )
             path = scope["path"]
-            if path.startswith(PREFIX):
+            page = path == "/console/"
+            if path.startswith(PREFIX) or page:
                 if b"authorization" in headers or any(k.startswith(b"x-ravn-") for k in headers):
                     raise RavnError(
                         401,
@@ -554,13 +469,22 @@ class ConsoleBoundary:
                         for part in headers.get(b"cookie", "").split(";")
                         if part.strip().startswith(self.console.cookie_name + "=")
                     ]
-                    if len(values) != 1:
+                    if len(values) > 1 or (not page and not values):
                         raise RavnError(
                             401, "unauthenticated", "Open the console with ravn console."
                         )
-                    p = self.console.authenticate(values[0])
-                    if mutation and not hmac.compare_digest(
-                        headers.get(b"x-csrf-token", "").encode("latin1"), p.csrf.encode()
+                    p = None
+                    try:
+                        if values:
+                            p = self.console.authenticate(values[0])
+                    except RavnError:
+                        if not page:
+                            raise
+                    if mutation and (
+                        p is None
+                        or not hmac.compare_digest(
+                            headers.get(b"x-csrf-token", "").encode("latin1"), p.csrf.encode()
+                        )
                     ):
                         raise RavnError(403, "permission_denied", "Invalid CSRF token.")
                     scope.setdefault("state", {})["operator"] = p
@@ -571,7 +495,7 @@ class ConsoleBoundary:
                         [
                             (
                                 b"content-security-policy",
-                                b"default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; object-src 'none'",
+                                b"default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; object-src 'none'; form-action 'self'",
                             ),
                             (b"referrer-policy", b"no-referrer"),
                             (b"x-content-type-options", b"nosniff"),
@@ -589,6 +513,8 @@ def create_console_app(console):
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None, redirect_slashes=False)
     app.add_middleware(ConsoleBoundary, console=console)
     attach_errors(app)
+    add_integration_routes(app, PREFIX, console.service, console)
+    add_application_routes(app, PREFIX, console.service, console)
 
     def p(request):
         return request.state.operator
@@ -682,14 +608,19 @@ def create_console_app(console):
             p(request), "sessions", identity, body.app_id, body.tenant_id, request.state.request_id
         )
 
-    @app.put(PREFIX + "/sessions/{identity}/permissions")
-    async def set_permissions(identity: str, body: PermissionRequest, request: Request):
-        return await console.set_permissions(
+    @app.api_route(
+        PREFIX + "/sessions/{identity}/connections/{connection_id}", methods=["PUT", "DELETE"]
+    )
+    async def session_connection(
+        identity: str, connection_id: str, body: TargetRequest, request: Request
+    ):
+        return await console.session_connection(
             p(request),
             identity,
+            connection_id,
             body.app_id,
             body.tenant_id,
-            body.tools,
+            request.method == "PUT",
             request.state.request_id,
         )
 
@@ -705,23 +636,7 @@ def create_console_app(console):
             revoke_sessions=body.revoke_sessions,
         )
 
-    @app.get("/")
-    async def root():
-        return RedirectResponse("/console/")
+    from ravn.console_pages import add_pages
 
-    @app.get("/console/")
-    async def index():
-        if not (STATIC / "index.html").is_file():
-            raise RavnError(
-                503,
-                "dependency_unavailable",
-                "Console assets are missing. Build broker/console first.",
-            )
-        return FileResponse(STATIC / "index.html")
-
-    if STATIC.is_dir():
-        app.mount("/console/assets", StaticFiles(directory=STATIC / "assets", check_dir=False))
-        app.mount(
-            "/console/reference", StaticFiles(directory=STATIC / "reference", check_dir=False)
-        )
+    add_pages(app, console)
     return app
