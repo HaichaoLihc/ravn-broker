@@ -1,0 +1,22 @@
+{
+  "id": "gmail",
+  "app_id": "my-agent",
+  "endpoint": "https://gmailmcp.googleapis.com/mcp/v1",
+  "oauth": {
+    "client_id": "YOUR_GOOGLE_CLIENT_ID",
+    "authorization_endpoint": "https://accounts.google.com/o/oauth2/v2/auth",
+    "token_endpoint": "https://oauth2.googleapis.com/token",
+    "issuer": "https://accounts.google.com",
+    "token_endpoint_auth_method": "client_secret_post",
+    "rotating_refresh_tokens": false,
+    "authorization_params": {
+      "access_type": "offline",
+      "prompt": "consent",
+      "include_granted_scopes": "false"
+    },
+    "scopes": [
+      "https://www.googleapis.com/auth/gmail.readonly"
+    ],
+    "client_secret": "YOUR_GOOGLE_CLIENT_SECRET"
+  }
+}

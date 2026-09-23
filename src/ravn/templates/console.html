@@ -1,0 +1,92 @@
+{% from 'macros.html' import icon, state, value, facts, field, action with context %}
+<!doctype html><html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+{% if operator %}<meta name="csrf-token" content="{{ operator.csrf }}">{% endif %}
+<title>{{ title or 'Operator console' }} · RAVN</title>
+<link rel="stylesheet" href="/console/static/console.css"><script src="/console/static/console.js" defer></script>
+</head><body {% if auto_refresh %}data-auto-refresh{% endif %}>
+<div id="message" class="error banner" role="alert" hidden></div>
+<noscript><p class="error">JavaScript is needed to sign in and submit changes. Signed-in pages can be read without it.</p></noscript>
+{% if not operator %}
+<div class="login"><main class="login-card"><div class="wordmark">ravn</div><h1>Operator console</h1>
+<p>This console is available to the owner of the RAVN server.</p><p class="muted">Open your console with a fresh sign-in link.</p>
+<code class="command">ravn console</code><p class="muted">Run the command on the server host. Links expire after 60 seconds and work once. Do not paste an application key here.</p>
+<a class="button" href="/console/">Check session</a></main></div>
+{% else %}
+<div class="console-shell">
+<aside class="sidebar" id="sidebar">
+<div class="brand"><a href="{{ url(app_id=app_id) }}">ravn</a><button class="icon-button" data-sidebar aria-label="Hide sidebar" title="Hide sidebar (⌘\\)">{{ icon('panel-left-close') }}</button></div>
+<nav aria-label="Console">{% for key, label, symbol in nav %}
+{% if label == 'Settings' %}<div class="nav-heading">Admin</div>{% endif %}
+<a href="{{ url(view=key,app_id=app_id) }}" {% if key == group %}aria-current="page"{% endif %}>{{ icon(symbol) }}{{ label }}</a>
+{% endfor %}</nav>
+<div class="operator">{{ action('/auth/logout','Sign out') }}<div class="identity"><span class="avatar">L</span><span>Local operator<small>Deployment owner</small></span></div></div>
+</aside>
+<div class="workspace">
+<header class="topbar"><div class="show-sidebar"><strong>ravn</strong><button class="icon-button" data-sidebar aria-label="Show sidebar">{{ icon('panel-left-open') }}</button></div>
+{{ icon(page_icon) }}<span>{{ title }}</span>
+{% if view == 'applications' or not boot.applications %}<span class="app-selector muted">All applications</span>{% else %}
+<form class="app-selector" action="/console/" method="get"><input type="hidden" name="view" value="{{ view }}">
+<label>App<select name="app_id" data-submit>{% for a in boot.applications %}<option value="{{ a.id }}" {% if a.id == app_id %}selected{% endif %}>{{ a.id }}{% if not a.enabled %} · disabled{% endif %}</option>{% endfor %}</select></label>
+<noscript><button>Switch</button></noscript></form>{% endif %}<span class="deployment" title="This deployment">{{ boot.deployment_id }}</span>
+</header>
+<main>
+<div class="page-header"><div><h1>{{ title }}</h1><p class="muted">{{ subtitle }}</p></div><a class="button" href="{{ back_url }}">Refresh</a></div>
+{% if group == 'calls' %}<nav class="tabs" aria-label="Activity views">{% for key,label in [('calls','Calls'),('events','Events')] %}<a href="{{ url(view=key,app_id=app_id) }}" {% if view == key %}aria-current="page"{% endif %}>{{ label }}</a>{% endfor %}
+<span>Last 24 hours · {{ 'auto-refresh paused' if query.cursor or detail else 'refreshes every 5s' }}</span></nav>{% endif %}
+{% if group == 'integrations' %}<nav class="tabs" aria-label="Settings views">{% for key,label in [('application','Application'),('integrations','Integrations'),('app-keys','Application keys'),('server','Server')] %}<a href="{{ url(view=key,app_id=app_id) }}" {% if view == key %}aria-current="page"{% endif %}>{{ label }}</a>{% endfor %}</nav>{% endif %}
+{% if error %}<div class="error banner" role="alert">{{ error }} <a href="{{ url(view=view,app_id=app_id) }}">Reload list</a></div>
+{% elif view == 'applications' %}{% include 'applications.html' %}
+{% elif listing %}
+{% if view == 'app-keys' and app_enabled %}<div class="key-create">
+  <form action="/console/api/v1/app-keys" method="post" data-method="POST" data-key>
+    <input type="hidden" name="app_id" value="{{ app_id }}">
+    {{ field('label', 'Key label', 'backend', required=true) }}<button class="button primary" type="submit">Generate key</button>
+  </form><p class="muted">The full key is shown once. Store it in your application's backend.</p>
+</div>{% endif %}
+{% if filters %}<form class="filters" action="/console/" method="get"><input type="hidden" name="view" value="{{ view }}"><input type="hidden" name="app_id" value="{{ app_id }}">
+{% if multi %}{{ field('tenant_id','Tenant',query.get('tenant_id','')) }}{% elif query.tenant_id %}<input type="hidden" name="tenant_id" value="{{ query.tenant_id }}">{% endif %}
+{{ field('user_id','User',query.get('user_id','')) }}
+{% if statuses %}<label>State<select name="status"><option value="">All states</option>{% for s in statuses %}<option value="{{ s }}" {% if query.status == s %}selected{% endif %}>{{ s | replace('_',' ') }}</option>{% endfor %}</select></label>{% endif %}
+<button class="apply">Apply filters</button>
+{% if query.user_id or query.status or query.tenant_id or query.connection_id or query.session_id %}<a class="clear" href="{{ url(view=view,app_id=app_id) }}">Clear filters</a>{% endif %}
+{% if filters | length > 3 %}<details class="advanced-filters"><summary>More filters</summary><div>
+{% for key in filters if key not in ['tenant_id','user_id','status'] %}
+{% if key == 'scope' %}<label>Scope<select name="scope"><option value="application">Application</option><option value="deployment" {% if query.scope == 'deployment' %}selected{% endif %}>Deployment</option></select></label>
+{% else %}{{ field(key,key | replace('_',' ') | capitalize,query.get(key,'')) }}{% endif %}
+{% endfor %}</div></details>{% endif %}</form>{% endif %}
+<div class="table-container">
+{% if listing.data %}<table><thead><tr><th>{{ {'connections':'Connection','sessions':'Session','calls':'Tool','events':'Event','app-keys':'Application key'}[view] }}</th>
+{% if view != 'app-keys' %}<th>User</th>{% if multi %}<th>Tenant</th>{% endif %}{% endif %}
+{% if view == 'events' %}<th>Actor category</th><th>Subject</th>{% else %}<th>State</th>{% endif %}
+{% if view in ['connections','sessions'] %}<th>Broker access</th>{% elif view == 'calls' %}<th>Effect</th><th>Duration</th>{% endif %}<th>{{ 'Expires' if view == 'sessions' else 'Created' }}</th></tr></thead>
+<tbody>{% for row in listing.data %}<tr {% if detail and detail.id == row.id %}aria-selected="true"{% endif %}>
+<td><a class="row-link" href="{{ url(**dict(query,view=view,app_id=app_id,id=row.id,record_tenant=row.get('tenant_id'))) }}">
+<span>{{ row.display_name if view == 'connections' else row.tool if view == 'calls' else row.kind if view == 'events' else row.label if view == 'app-keys' else row.id[:18] + '…' }}</span><code>{{ row.id }}</code></a></td>
+{% if view != 'app-keys' %}<td>{{ row.user_id or '—' }}</td>{% if multi %}<td>{{ row.tenant_id or '—' }}</td>{% endif %}{% endif %}
+{% if view == 'events' %}<td>{{ row.actor_kind }}</td><td><code>{{ row.subject_id }}</code></td>{% else %}<td>{{ state(('revoked' if row.revoked_at else 'active') if view == 'app-keys' else row.status) }}</td>{% endif %}
+{% if view in ['connections','sessions'] %}<td>{{ state(row.broker_access) }}</td>{% elif view == 'calls' %}<td>{{ 'Read' if row.effect == 'read' else 'Write' if row.effect == 'write' else 'Provider-defined' }}</td><td>{{ (row.duration_ms | string) + ' ms' if row.duration_ms is not none else '—' }}</td>{% endif %}
+<td>{{ value(row.expires_at if view == 'sessions' else row.created_at) }}</td></tr>{% endfor %}</tbody></table>
+{% else %}<div class="empty"><h2>{{ 'No matching records.' if query.user_id or query.status or query.connection_id else 'No ' + view.replace('-',' ') + ' yet.' }}</h2>
+{% if view == 'connections' %}<p>Connect an account through your backend or CLI after configuring the integration.</p><code class="command">ravn connections connect --integration YOUR_INTEGRATION --app-key-file … --user …</code><p class="muted">Personal-token import is also available.</p>
+{% elif view == 'sessions' %}<p>Create a session from your trusted backend or CLI after connecting an account.</p>
+{% elif view == 'app-keys' %}<p>{{ "Generate a key above for your application's backend." if app_enabled else 'Enable this application in Settings → Application before generating a key.' }}</p>
+{% else %}<p>Only recorded activity appears here. Pre-admission denials are not a complete audit history.</p>{% endif %}</div>{% endif %}
+</div><footer class="list-footer"><span>{{ listing.data | length }} loaded · updated {{ value(listing.as_of) }}</span>{% if listing.next_cursor %}<a class="button" href="{{ url(**dict(query,view=view,app_id=app_id,cursor=listing.next_cursor,id=None,map=None,connection_cursor=None,record_tenant=None)) }}">Next page</a>{% endif %}</footer>
+{% elif view == 'integrations' %}<div class="settings-content">{% include 'integrations.html' %}</div>
+{% elif view == 'application' %}<div class="settings-content">{% include 'application.html' %}</div>
+{% elif view == 'server' %}<div class="settings-content"><section><h2>Server</h2>
+{{ facts([('Deployment',boot.deployment_id),('Version',boot.version),('Local readiness','Ready' if boot.ready else 'Not ready'),('Broker URL',boot.public_url),('Default runtime lifetime',boot.sessions.default_ttl_seconds | string + ' seconds'),('Maximum runtime lifetime',boot.sessions.max_ttl_seconds | string + ' seconds'),('Console access','Loopback · local owner only'),('Provider compatibility','Live verification not performed'),('OAuth / refresh','Implemented · configure provider apps'),('Session access','Inherited from attached connections'),('Tool retries','Never automatic')]) }}
+<p class="muted">Server configuration is read-only here. Restart to apply file changes. Applications and integrations are managed in the Console and apply immediately.</p></section></div>{% endif %}
+{% if detail and not error %}{% include 'detail.html' %}{% endif %}
+</main></div></div>
+<dialog id="confirm" aria-labelledby="confirm-title" aria-describedby="confirm-description"><form method="dialog"><div class="confirm-content"><h2 id="confirm-title">Confirm access change</h2><p id="confirm-description"></p><dl id="confirm-facts" class="facts"></dl>
+<label id="confirm-key" class="check" hidden><input type="checkbox"> Also revoke every runtime session issued by this key</label>
+<p class="consequence">New calls are blocked once revocation commits. Already-admitted calls may still finish.</p></div><footer><button class="button ghost" value="cancel">Cancel</button><button class="button danger" value="confirm">Confirm</button></footer></form></dialog>
+<div class="toast" id="toast" role="status" hidden>{{ icon('check') }}<span></span><button class="icon-button" aria-label="Dismiss">{{ icon('x') }}</button></div>
+<dialog id="new-key" aria-labelledby="new-key-title"><form method="dialog"><div class="confirm-content">
+<h2 id="new-key-title">Save your application key</h2><p>Copy it now. RAVN stores only a hash and cannot display the key again.</p>
+<label>Application key<input id="generated-key" type="password" readonly autocomplete="off"></label>
+<p class="muted">Keep this key in your backend. Agents use separate session tokens.</p>
+</div><footer><button type="button" class="button" id="copy-new-key">Copy key</button><button class="button primary">Done</button></footer></form></dialog>
+{% endif %}</body></html>

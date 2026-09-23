@@ -1,74 +1,15 @@
-"""Three explicit OAuth profiles. No metadata-controlled destinations or automatic retries."""
+"""Configured OAuth2 authorization-code flow with S256 PKCE and bounded token exchange."""
 
 import asyncio
 import base64
 import hashlib
 import re
 from datetime import UTC, datetime, timedelta
-from urllib.parse import urlencode
+from urllib.parse import quote_plus, urlencode, urlsplit
 
 import httpx2
 
 from ravn.common import RavnError, strict_json
-from ravn.crypto import private_file
-
-# Google reports some requested short scopes in their long URL form.
-GOOGLE_SCOPE_ALIASES = {
-    "email": "https://www.googleapis.com/auth/userinfo.email",
-    "profile": "https://www.googleapis.com/auth/userinfo.profile",
-}
-PROFILES = {
-    "github_app_pkce": {
-        "host": "github.com",
-        "authorize": "https://github.com/login/oauth/authorize",
-        "token": "https://github.com/login/oauth/access_token",
-        "issuer": "https://github.com",
-        "pkce": True,
-        "scope_separator": None,
-        "authorize_params": {},
-        "token_type": "bearer",
-        "prefixes": ("ghu_",),
-        "scope_pattern": r"[A-Za-z0-9_:, .-]*",
-        "rotates_refresh": True,
-        "requires_granted_scopes": False,
-    },
-    "slack_user_confidential": {
-        "host": "slack.com",
-        "authorize": "https://slack.com/oauth/v2_user/authorize",
-        "token": "https://slack.com/api/oauth.v2.user.access",
-        "issuer": "https://mcp.slack.com",
-        "pkce": False,
-        "scope_separator": ",",
-        "authorize_params": {},
-        "token_type": "user",
-        "prefixes": ("xoxp-", "xoxe.xoxp-"),
-        "scope_pattern": r"[A-Za-z0-9_:, .-]*",
-        "rotates_refresh": True,
-        "requires_granted_scopes": False,
-    },
-    "google_web_pkce": {
-        "host": "oauth2.googleapis.com",
-        "authorize": "https://accounts.google.com/o/oauth2/v2/auth",
-        "token": "https://oauth2.googleapis.com/token",
-        "issuer": "https://accounts.google.com",
-        "pkce": True,
-        "scope_separator": " ",
-        # Offline access returns a refresh token; forcing consent returns one on
-        # every connect, and never merging older grants keeps authority exact.
-        "authorize_params": {
-            "access_type": "offline",
-            "prompt": "consent",
-            "include_granted_scopes": "false",
-        },
-        "token_type": "bearer",
-        "prefixes": ("ya29.",),
-        "scope_pattern": r"[A-Za-z0-9_:, ./-]*",
-        # Google keeps the refresh token stable; a refresh response omits it.
-        "rotates_refresh": False,
-        # Google's consent screen lets users untick individual scopes.
-        "requires_granted_scopes": True,
-    },
-}
 
 
 def deadline(seconds):
@@ -90,13 +31,12 @@ def secret(value):
 
 
 class OAuthProvider:
-    def __init__(self, integration, provider, callback):
+    def __init__(self, integration, provider, callback, *, client_secret=None):
         self.integration, self.provider, self.callback = integration, provider, callback
         self.config = integration.oauth
-        self.profile = PROFILES[self.config.profile]
-        self.slack = integration.connector == "slack"
-        self.host = self.profile["host"]
-        self.endpoint = self.profile["token"]
+        self.client_secret = client_secret
+        self.host = urlsplit(self.config.token_endpoint).hostname
+        self.endpoint = self.config.token_endpoint
 
     def authorize_url(self, state, verifier):
         params = {
@@ -105,22 +45,22 @@ class OAuthProvider:
             "state": state,
             "response_type": "code",
         }
-        if self.profile["scope_separator"]:
-            params["scope"] = self.profile["scope_separator"].join(self.config.scopes)
-        if self.profile["pkce"]:
-            params.update(
-                code_challenge=base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest())
-                .rstrip(b"=")
-                .decode(),
-                code_challenge_method="S256",
-            )
-        params.update(self.profile["authorize_params"])
-        return self.profile["authorize"] + "?" + urlencode(params)
+        if self.config.scopes:
+            params["scope"] = " ".join(self.config.scopes)
+        if self.config.resource:
+            params["resource"] = self.config.resource
+        params.update(
+            code_challenge=base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest())
+            .rstrip(b"=")
+            .decode(),
+            code_challenge_method="S256",
+        )
+        params.update(self.config.authorization_params)
+        return self.config.authorization_endpoint + "?" + urlencode(params)
 
     async def exchange(self, code, verifier):
         data = {"grant_type": "authorization_code", "code": code, "redirect_uri": self.callback}
-        if self.profile["pkce"]:
-            data["code_verifier"] = verifier
+        data["code_verifier"] = verifier
         return await self.request(data)
 
     async def refresh(self, bundle):
@@ -129,16 +69,24 @@ class OAuthProvider:
             previous=bundle,
         )
 
-    def granted(self, scopes):
-        aliases = GOOGLE_SCOPE_ALIASES if self.config.profile == "google_web_pkce" else {}
-        return {aliases.get(scope, scope) for scope in scopes}
-
     async def request(self, data, previous=None):
         try:
-            client_secret = secret(private_file(self.config.client_secret_file).decode())
-            # Slack MCP metadata advertises client_secret_post; credentials are
-            # form body fields, never URL parameters (same for GitHub and Google).
-            data = {**data, "client_id": self.config.client_id, "client_secret": client_secret}
+            if self.config.resource:
+                data = {**data, "resource": self.config.resource}
+            headers = {"Accept": "application/json", "Accept-Encoding": "identity"}
+            if self.config.token_endpoint_auth_method == "none":
+                data = {**data, "client_id": self.config.client_id}
+            else:
+                client_secret = secret(self.client_secret)
+                if self.config.token_endpoint_auth_method == "client_secret_basic":
+                    pair = quote_plus(self.config.client_id) + ":" + quote_plus(client_secret)
+                    headers["Authorization"] = "Basic " + base64.b64encode(pair.encode()).decode()
+                else:
+                    data = {
+                        **data,
+                        "client_id": self.config.client_id,
+                        "client_secret": client_secret,
+                    }
             async with (
                 asyncio.timeout(15),
                 httpx2.AsyncClient(
@@ -151,7 +99,7 @@ class OAuthProvider:
                 response = await client.post(
                     self.endpoint,
                     data=data,
-                    headers={"Accept": "application/json", "Accept-Encoding": "identity"},
+                    headers=headers,
                 )
             if len(response.content) > 65536:
                 raise ValueError("Oversized token response")
@@ -169,22 +117,16 @@ class OAuthProvider:
                 raise RavnError(
                     409, "connection_reauth_required", "Provider authorization must be renewed."
                 )
-            if (
-                response.status_code != 200
-                or value.get("error")
-                or (self.slack and value.get("ok") is not True)
-            ):
+            if response.status_code != 200 or value.get("error"):
                 raise ValueError("Token exchange failed")
             access = secret(value.get("access_token"))
-            if value.get("token_type", "").lower() != self.profile["token_type"]:
+            if value.get("token_type", "").lower() != "bearer":
                 raise ValueError("Unexpected token type")
-            if not access.startswith(self.profile["prefixes"]):
-                raise ValueError("Unexpected token authority")
             refresh = (
                 secret(value["refresh_token"]) if value.get("refresh_token") is not None else None
             )
             if previous is not None and not refresh:
-                if self.profile["rotates_refresh"]:
+                if self.config.rotating_refresh_tokens:
                     # Rotating profiles: absence is not permission to reuse the old token.
                     raise ValueError("Missing rotated refresh token")
                 refresh = previous["refresh_token"]
@@ -198,23 +140,19 @@ class OAuthProvider:
                 return deadline(seconds)
 
             scopes = value.get("scope")
-            if scopes is None and self.slack:
-                scopes = value.get("authed_user", {}).get("scope")
             if scopes is not None and (
                 not isinstance(scopes, str)
                 or len(scopes) > 4096
-                or not re.fullmatch(self.profile["scope_pattern"], scopes)
+                or not re.fullmatch(r"[\x21\x23-\x5b\x5d-\x7e ]*", scopes)
             ):
                 raise ValueError("Invalid scope response")
-            granted = sorted(set(scopes.replace(",", " ").split())) if scopes is not None else None
-            if self.profile["requires_granted_scopes"] and not self.granted(
-                self.config.scopes
-            ) <= self.granted(granted or []):
-                raise RavnError(
-                    403,
-                    "insufficient_scope",
-                    "Grant every requested permission on the consent screen, then connect again.",
+            granted = (
+                sorted(set(scopes.split()))
+                if scopes is not None
+                else (
+                    previous.get("granted_scopes") if previous else sorted(set(self.config.scopes))
                 )
+            )
             expires = expiry("expires_in")
             if refresh and not expires:
                 raise ValueError("Refreshable tokens require an access-token lifetime")

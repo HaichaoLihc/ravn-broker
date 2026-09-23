@@ -3,16 +3,18 @@
 import asyncio
 import hmac
 import json
+import logging
 import secrets
 from contextlib import asynccontextmanager
 from urllib.parse import urlencode
 
 from ravn.common import Principal, RavnError, canonical, digest, identifier, now
-from ravn.oauth_provider import PROFILES, OAuthProvider, deadline
+from ravn.oauth_provider import OAuthProvider, deadline
 from ravn.store import event, finish, one
 
 LIVE = ("pending", "authorizing", "exchanging", "awaiting_completion")
 WIPE = "ticket_hash=NULL,state_hash=NULL,cookie_hash=NULL,verifier=NULL,staged=NULL,completion_hash=NULL"
+logger = logging.getLogger(__name__)
 
 
 def public_flow(row):
@@ -44,7 +46,17 @@ class Onboarding:
             self.config.server.public_url.rstrip("/")
             + f"/oauth/callback/{integration.app_id}/{integration.id}"
         )
-        return OAuthProvider(integration, self.service.provider_for(integration), callback)
+        registered = self.service.integrations.get(integration.app_id, integration.id)
+        return OAuthProvider(
+            integration,
+            self.service.provider_for(integration),
+            callback,
+            client_secret=(
+                registered.oauth.client_secret.get_secret_value()
+                if registered.oauth.client_secret
+                else None
+            ),
+        )
 
     def fingerprint(self, integration):
         return digest(integration.model_dump_json())
@@ -79,13 +91,13 @@ class Onboarding:
     async def live(self, db, row):
         p = Principal(row["app_id"], row["tenant_id"], row["user_id"], key_id=row["issuing_key_id"])
         await self.service.validate_principal(db, p)
-        integration = self.config.integration(p.app, row["integration_id"])
+        integration = self.service.integrations.get(p.app, row["integration_id"])
         if (
             not integration
             or not integration.enabled
             or not integration.oauth
             or self.fingerprint(integration) != row["integration_fingerprint"]
-            or row["return_url"] not in self.config.app(p.app).return_urls
+            or row["return_url"] not in self.service.applications.get(p.app).return_urls
         ):
             raise RavnError(409, "connection_disabled", "OAuth configuration changed; start again.")
         if row["expires_at"] <= now() or (
@@ -107,16 +119,10 @@ class Onboarding:
 
     async def start(self, p, integration_id, return_url, app_state, reconnect_id=None):
         await self.cleanup()
-        integration = self.config.integration(p.app, integration_id)
+        integration = self.service.integrations.get(p.app, integration_id)
         if not integration or not integration.enabled or not integration.oauth:
             raise RavnError(
                 409, "integration_not_ready", "OAuth is not configured for this integration."
-            )
-        if return_url not in self.config.app(p.app).return_urls:
-            raise RavnError(
-                400,
-                "invalid_return_url",
-                "Return URL must exactly match application configuration.",
             )
         sid, ticket, created, expires = (
             identifier("cs"),
@@ -126,6 +132,12 @@ class Onboarding:
         )
         async with self.store.transaction() as db:
             await self.service.validate_principal(db, p)
+            if return_url not in self.service.applications.get(p.app).return_urls:
+                raise RavnError(
+                    400, "invalid_return_url", "Return URL must exactly match application settings."
+                )
+            if not self.service.integrations.get(p.app, integration_id).enabled:
+                raise RavnError(409, "connection_disabled", "Integration is disabled.")
             count = await one(
                 db,
                 "SELECT count(*) AS n FROM connect_sessions WHERE status IN ('pending','authorizing','exchanging','awaiting_completion')",
@@ -144,6 +156,12 @@ class Onboarding:
             epoch = None
             if reconnect_id:
                 conn, _ = await self.service.authorize(db, p, reconnect_id)
+                if not integration.identity or not conn["provider_account_id"]:
+                    raise RavnError(
+                        409,
+                        "new_connection_required",
+                        "Account identity is unavailable. Connect again without reconnect_connection_id, then attach the new connection to the sessions that should use it.",
+                    )
                 if conn["integration_id"] != integration_id or conn["status"] == "disconnected":
                     raise RavnError(409, "connection_disabled", "Connection cannot be reconnected.")
                 epoch = conn["epoch"]
@@ -241,7 +259,7 @@ class Onboarding:
                     "OAuth browser binding is invalid or already consumed.",
                 )
             p, integration = await self.live(db, row)
-            if query.get("iss") and query["iss"] != PROFILES[integration.oauth.profile]["issuer"]:
+            if query.get("iss") and query["iss"] != integration.oauth.issuer:
                 raise RavnError(400, "invalid_oauth_transaction", "Unexpected OAuth issuer.")
             if "error" in query:
                 await self.terminal(db, p, row, "denied", "authorization_denied")
@@ -256,9 +274,11 @@ class Onboarding:
                 "UPDATE connect_sessions SET status='exchanging',state_hash=NULL,cookie_hash=NULL,verifier=NULL,updated_at=? WHERE id=?",
                 (now(), row["id"]),
             )
+        phase = "token_exchange"
         try:
             async with self.service.slots(p, "oauth"):
                 bundle = await self.provider(integration).exchange(code, verifier)
+                phase = "account_verification"
                 account, display = await self.service.provider_for(integration).identify(
                     bundle["access_token"]
                 )
@@ -293,6 +313,14 @@ class Onboarding:
             return row["id"], self.returned(row, completion_code=completion)
         except BaseException as exc:
             code = exc.code if isinstance(exc, RavnError) else "oauth_exchange_failed"
+            # Our errors contain fixed messages; never log upstream exceptions or payloads.
+            logger.warning(
+                "OAuth connection failed: session=%s phase=%s code=%s reason=%s",
+                row["id"],
+                phase,
+                code,
+                exc.message if isinstance(exc, RavnError) else type(exc).__name__,
+            )
 
             async def fail():
                 async with self.store.transaction() as db:
@@ -314,7 +342,7 @@ class Onboarding:
             + sid
         )
 
-    async def complete(self, p, sid, completion):
+    async def complete(self, p, sid, completion, label=None):
         await self.cleanup()
         async with self.store.transaction() as db:
             row = await self.row(db, p, sid)
@@ -338,19 +366,16 @@ class Onboarding:
                     "UPDATE connections SET ciphertext=?,credential_type='oauth2',credential_version=credential_version+1,refresh_attempt=NULL,status='active',epoch=epoch+1,revision=revision+1,updated_at=? WHERE app_id=? AND tenant_id=? AND id=?",
                     (ciphertext, now(), p.app, p.tenant, cid),
                 )
-                await db.execute(
-                    "UPDATE sessions SET revoked_at=COALESCE(revoked_at,?) WHERE app_id=? AND tenant_id=? AND connection_id=?",
-                    (now(), p.app, p.tenant, cid),
-                )
             else:
                 await db.execute(
-                    "INSERT INTO connections(id,app_id,tenant_id,user_id,integration_id,provider_account_id,display_name,status,ciphertext,key_id,created_at,updated_at,credential_type) VALUES(?,?,?,?,?,?,?,'active',?,?,?,?,'oauth2')",
+                    "INSERT INTO connections(id,app_id,tenant_id,user_id,integration_id,provider_account_id,display_name,label,status,ciphertext,key_id,created_at,updated_at,credential_type) VALUES(?,?,?,?,?,?,?,?,'active',?,?,?,?,'oauth2')",
                     (
                         cid,
                         *p.namespace,
                         row["integration_id"],
                         bundle["provider_account_id"],
                         bundle["display_name"],
+                        label,
                         ciphertext,
                         self.cipher.key_id,
                         now(),
@@ -409,9 +434,13 @@ class Onboarding:
                         "Credential expired; reconnect this account.",
                     )
                 replacement = await self.provider(integration).refresh(bundle)
-                account, display = await self.service.provider_for(integration).identify(
-                    replacement["access_token"]
-                )
+                # Refresh remains bound to the existing grant. No extra MCP call is needed
+                # when there is no optional identity verifier.
+                account, display = conn["provider_account_id"], conn["display_name"]
+                if integration.identity:
+                    account, display = await self.service.provider_for(integration).identify(
+                        replacement["access_token"]
+                    )
                 if account != conn["provider_account_id"]:
                     raise RavnError(
                         409,
@@ -420,9 +449,17 @@ class Onboarding:
                     )
                 replacement.update(provider_account_id=account, display_name=display)
                 async with self.store.transaction() as db:
-                    current, _ = await self.service.authorize(db, p, cid, execute=True)
+                    # Preserve rotated credentials for every session sharing this grant,
+                    # even if this caller lost access while the provider was refreshing.
+                    current = await one(
+                        db,
+                        "SELECT * FROM connections WHERE app_id=? AND tenant_id=? AND user_id=? AND id=?",
+                        (*p.namespace, cid),
+                    )
                     if (
-                        current["epoch"] != conn["epoch"]
+                        current is None
+                        or current["status"] != "active"
+                        or current["epoch"] != conn["epoch"]
                         or current["credential_version"] != conn["credential_version"]
                         or current["refresh_attempt"] != attempt
                     ):
@@ -444,7 +481,6 @@ class Onboarding:
                         ),
                     )
                     await event(db, p, "credential.refreshed", cid)
-                return replacement["access_token"], integration
             except BaseException as exc:
 
                 async def fail():
@@ -472,6 +508,9 @@ class Onboarding:
                     "connection_reauth_required",
                     "Credential refresh could not be safely completed; reconnect this account.",
                 ) from None
+            async with self.store.transaction() as db:
+                await self.service.authorize(db, p, cid, execute=True)
+            return replacement["access_token"], integration
 
     async def rejected(self, p, cid, credential):
         # A late 401 for an old credential must not disable a successful refresh
@@ -482,7 +521,8 @@ class Onboarding:
                 "SELECT * FROM connections WHERE app_id=? AND tenant_id=? AND id=? AND status='active'",
                 (p.app, p.tenant, cid),
             )
-            if not conn:
+            # An in-flight refresh owns the outcome for this old credential.
+            if not conn or conn["refresh_attempt"]:
                 return
             raw = self.cipher.decrypt(conn["ciphertext"], p.app, p.tenant, cid)
             current = (

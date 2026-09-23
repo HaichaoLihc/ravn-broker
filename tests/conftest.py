@@ -6,16 +6,18 @@ from urllib.parse import parse_qs, urlsplit
 import httpx
 import httpx2
 import pytest
+from fake_tools import SCHEMAS
 from mcp import Client, types
 from mcp.client.streamable_http import streamable_http_client
 from mcp.server import Server
 from mcp.server.transport_security import TransportSecuritySettings
 
 from ravn.app import create_app
-from ravn.config import Config
+from ravn.catalogue import tool_name
+from ravn.config import Application, Config
 from ravn.console import PREFIX, Console, create_console_app
-from ravn.github import GitHub
-from ravn.manifest import SCHEMAS, schema_hash
+from ravn.integrations import IntegrationRegistration
+from ravn.provider import RemoteMCP
 
 ALICE = "test_alice_provider_secret_123456789"
 BOB = "test_bob_provider_secret_123456789"
@@ -26,7 +28,7 @@ def anyio_backend():
     return "asyncio"
 
 
-class FakeGitHub:
+class FakeProvider:
     def __init__(self):
         self.calls = []
         self.headers = []
@@ -37,15 +39,8 @@ class FakeGitHub:
         self.fail = False
         self.echo = False
         self.tools = [types.Tool(name=name, inputSchema=schema) for name, schema in SCHEMAS.items()]
-        self.tools.append(
-            types.Tool(
-                name="add_issue_comment",
-                inputSchema={"type": "object"},
-                annotations=types.ToolAnnotations(readOnlyHint=True),
-            )
-        )
         self.server = Server(
-            "fake-github", on_list_tools=self.list_tools, on_call_tool=self.call_tool
+            "fake-records", on_list_tools=self.list_tools, on_call_tool=self.call_tool
         )
         self.app = self.server.streamable_http_app(
             streamable_http_path="/mcp/",
@@ -75,7 +70,7 @@ class FakeGitHub:
         return types.CallToolResult(content=[types.TextContent(type="text", text=value)])
 
     def transport(self, host):
-        if host == "api.githubcopilot.com":
+        if host == "mcp.records.example":
             return httpx2.ASGITransport(app=self.app)
 
         def identity(request):
@@ -98,20 +93,34 @@ def config(tmp_path):
     key = tmp_path / "master.key"
     key.write_bytes(base64.b64encode(b"x" * 32))
     key.chmod(0o600)
-    fake = FakeGitHub()
-    pins = {t.name: schema_hash(t) for t in fake.tools if t.name in SCHEMAS}
     return Config.model_validate(
         {
             "deployment_id": "test-deployment",
             "server": {"admin_socket": str(tmp_path / "run/admin.sock")},
             "storage": {"sqlite_path": str(tmp_path / "state/ravn.db")},
             "secrets": {"managed": {"active_key_id": "test-key", "key_source": {"path": str(key)}}},
-            "applications": [{"id": "demo"}, {"id": "saas", "tenant_mode": "multi"}],
-            "integrations": [
-                {"id": "github", "app_id": app, "schema_hashes": pins} for app in ["demo", "saas"]
-            ],
         }
     )
+
+
+def records_integration(app_id="demo", **patch):
+    return IntegrationRegistration.model_validate(
+        {
+            "id": "records",
+            "app_id": app_id,
+            "endpoint": "https://mcp.records.example/mcp/",
+            "identity": {
+                "endpoint": "https://identity.records.example/user",
+                "id_field": "id",
+                "display_field": "login",
+            },
+            **patch,
+        }
+    )
+
+
+async def add_application(service, app_id="demo", **patch):
+    return await service.applications.save(Application(id=app_id, **patch), create=True)
 
 
 class Rig:
@@ -130,7 +139,7 @@ class Rig:
             "/v1/connections/import",
             headers=self.headers(user, tenant, key),
             json={
-                "integration_id": "github",
+                "integration_id": "records",
                 "credential": {"type": "bearer", "token": credential},
             },
         )
@@ -138,7 +147,7 @@ class Rig:
         return response.json()
 
     async def session(self, connection, user="alice", tenant=None, key=None, ttl=None):
-        body = {"connection_id": connection["id"]}
+        body = {"connection_ids": [connection["id"]]}
         if ttl is not None:
             body["ttl_seconds"] = ttl
         response = await self.http.post(
@@ -158,16 +167,23 @@ class Rig:
                 mode=mode,
                 cache=None,
             ) as client:
+                client.ravn_name = lambda name: tool_name(session["connections"][0]["id"], name)
                 yield client
 
 
 @pytest.fixture
 async def rig(config):
-    fake = FakeGitHub()
-    provider = GitHub(transport_factory=fake.transport)
-    app = create_app(config, provider=provider)
+    fake = FakeProvider()
+    app = create_app(config)
     async with fake.server.session_manager.run(), app.router.lifespan_context(app):
         service = app.state.service
+        for app_id, tenant_mode in [("demo", "single"), ("saas", "multi")]:
+            await add_application(service, app_id, tenant_mode=tenant_mode)
+            item = records_integration(app_id)
+            await service.integrations.create(item)
+            service.providers[(app_id, "records")] = RemoteMCP(
+                item, transport_factory=fake.transport
+            )
         key = (await service.create_key("demo", "test"))["key"]
         saas_key = (await service.create_key("saas", "test"))["key"]
         async with httpx.AsyncClient(

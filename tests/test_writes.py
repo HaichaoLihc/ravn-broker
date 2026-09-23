@@ -1,15 +1,14 @@
-"""Reviewed writes: optional idempotency keys, no automatic retry, ambiguous outcomes stay unknown."""
+"""Provider operations: optional idempotency keys, no automatic retry, ambiguous outcomes stay unknown."""
 
 import asyncio
 import base64
 import json
-from contextlib import asynccontextmanager
-from urllib.parse import parse_qs, urlsplit
 
 import httpx
 import httpx2
 import pytest
-from conftest import Rig
+from conftest import Rig, add_application
+from fake_tools import MAIL_SCHEMAS
 from mcp import types
 from mcp.server import Server
 from mcp.server.transport_security import TransportSecuritySettings
@@ -17,17 +16,15 @@ from mcp.shared.exceptions import MCPError
 
 from ravn.app import create_app
 from ravn.config import Config
-from ravn.console import PREFIX, Console, create_console_app
-from ravn.github import GitHub
-from ravn.gmail import Gmail
-from ravn.manifest import GMAIL_SCHEMAS, schema_hash
+from ravn.integrations import IntegrationRegistration
+from ravn.provider import RemoteMCP
 
 pytestmark = pytest.mark.anyio
-TOKEN = "ya29.alice-gmail-credential"
+TOKEN = "mail_alice-mail-credential"
 DRAFT = {"to": ["dana@example.com"], "subject": "Re: Refund #1042", "body": "It is processing."}
 
 
-class FakeGmail:
+class FakeMail:
     def __init__(self):
         self.calls, self.metas = [], []
         self.listing = 0
@@ -36,16 +33,8 @@ class FakeGmail:
         self.release = asyncio.Event()
         self.lose_response = False
         self.deny_next = False
-        self.tools = [types.Tool(name=n, inputSchema=s) for n, s in GMAIL_SCHEMAS.items()]
-        # An upstream write RAVN has not reviewed must never become reachable.
-        self.tools.append(
-            types.Tool(
-                name="label_thread",
-                inputSchema={"type": "object"},
-                annotations=types.ToolAnnotations(readOnlyHint=True),
-            )
-        )
-        self.server = Server("fake-gmail", on_list_tools=self.list_tools, on_call_tool=self.call)
+        self.tools = [types.Tool(name=n, inputSchema=s) for n, s in MAIL_SCHEMAS.items()]
+        self.server = Server("fake-mail", on_list_tools=self.list_tools, on_call_tool=self.call)
         self.app = self.server.streamable_http_app(
             streamable_http_path="/mcp/v1",
             stateless_http=True,
@@ -70,7 +59,7 @@ class FakeGmail:
         )
 
     def transport(self, host):
-        if host == "gmailmcp.googleapis.com":
+        if host == "mcp.mail.example":
             return Faulty(self)
         return httpx2.MockTransport(
             lambda request: httpx2.Response(
@@ -98,38 +87,35 @@ class Faulty(httpx2.AsyncBaseTransport):
 
 
 @pytest.fixture
-async def gmail(tmp_path):
+async def mail(tmp_path):
     key = tmp_path / "master.key"
     key.write_bytes(base64.b64encode(b"y" * 32))
     key.chmod(0o600)
-    fake = FakeGmail()
+    fake = FakeMail()
     config = Config.model_validate(
         {
             "deployment_id": "write-tests",
             "server": {"admin_socket": str(tmp_path / "run/admin.sock")},
             "storage": {"sqlite_path": str(tmp_path / "state/ravn.db")},
             "secrets": {"managed": {"active_key_id": "test-key", "key_source": {"path": str(key)}}},
-            "applications": [{"id": "demo"}],
-            "integrations": [
-                {
-                    "id": "gmail",
-                    "app_id": "demo",
-                    "connector": "gmail",
-                    "endpoint": "https://gmailmcp.googleapis.com/mcp/v1",
-                    "manifest": "builtin:gmail-v1",
-                    "schema_hashes": {
-                        t.name: schema_hash(t) for t in fake.tools if t.name in GMAIL_SCHEMAS
-                    },
-                }
-            ],
         }
     )
-    app = create_app(
-        config,
-        provider={"github_cloud": GitHub(), "gmail": Gmail(transport_factory=fake.transport)},
+    item = IntegrationRegistration.model_validate(
+        {
+            "id": "mail",
+            "app_id": "demo",
+            "endpoint": "https://mcp.mail.example/mcp/v1",
+            "identity": {
+                "endpoint": "https://identity.mail.example/userinfo",
+                "required_claims": {"email_verified": True},
+            },
+        }
     )
+    app = create_app(config, provider=RemoteMCP(item, transport_factory=fake.transport))
     async with fake.server.session_manager.run(), app.router.lifespan_context(app):
         service = app.state.service
+        await add_application(service)
+        await service.integrations.create(item)
         app_key = (await service.create_key("demo", "test"))["key"]
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1:8787"
@@ -138,7 +124,7 @@ async def gmail(tmp_path):
             response = await http.post(
                 "/v1/connections/import",
                 headers=rig.headers(),
-                json={"integration_id": "gmail", "credential": {"type": "bearer", "token": TOKEN}},
+                json={"integration_id": "mail", "credential": {"type": "bearer", "token": TOKEN}},
             )
             assert response.status_code == 201, response.text
             rig.conn = response.json()
@@ -148,7 +134,7 @@ async def gmail(tmp_path):
 
 async def draft(mcp, key=None, arguments=DRAFT, name="create_draft"):
     meta = {"ravn/idempotency-key": key} if key else None
-    return await mcp.session.call_tool(name, arguments, meta=meta)
+    return await mcp.session.call_tool(mcp.ravn_name(name), arguments, meta=meta)
 
 
 async def refused(mcp, **kwargs):
@@ -163,50 +149,48 @@ async def call_status(rig, call_id):
     return response.json()
 
 
-async def test_catalogue_marks_the_draft_write_and_hides_unreviewed_writes(gmail):
-    async with gmail.mcp(gmail.runtime) as mcp:
-        tools = {t.name: t for t in (await mcp.list_tools()).tools}
-    assert set(tools) == set(GMAIL_SCHEMAS)
-    assert tools["create_draft"].annotations.read_only_hint is False
-    assert "never sent" in tools["create_draft"].description
-    assert tools["search_threads"].annotations.read_only_hint is True
+async def test_catalogue_preserves_provider_schemas(mail):
+    async with mail.mcp(mail.runtime) as mcp:
+        tools = {t.meta["ravn/tool-name"]: t for t in (await mcp.list_tools()).tools}
+    assert set(tools) == set(MAIL_SCHEMAS)
+    assert tools["create_draft"].input_schema == MAIL_SCHEMAS["create_draft"]
 
 
-async def test_keyless_submissions_each_dispatch(gmail):
-    async with gmail.mcp(gmail.runtime) as mcp:
+async def test_keyless_submissions_each_dispatch(mail):
+    async with mail.mcp(mail.runtime) as mcp:
         first, second = await draft(mcp), await draft(mcp)
-    assert len(gmail.fake.calls) == 2
+    assert len(mail.fake.calls) == 2
     assert first.meta["ravn/call-id"] != second.meta["ravn/call-id"]
-    assert (await call_status(gmail, first.meta["ravn/call-id"]))["effect"] == "write"
+    assert (await call_status(mail, first.meta["ravn/call-id"]))["effect"] == "unknown"
 
 
-async def test_same_key_dispatches_once_and_replays_without_result(gmail):
-    async with gmail.mcp(gmail.runtime) as mcp:
+async def test_same_key_dispatches_once_and_replays_without_result(mail):
+    async with mail.mcp(mail.runtime) as mcp:
         first = await draft(mcp, key="draft-1042-a")
         again = await draft(mcp, key="draft-1042-a")
-    assert gmail.fake.calls == [("create_draft", DRAFT)]
+    assert mail.fake.calls == [("create_draft", DRAFT)]
     # The RAVN extension is consumed locally, never forwarded upstream.
-    assert not any(meta and "ravn/idempotency-key" in meta for meta in gmail.fake.metas)
+    assert not any(meta and "ravn/idempotency-key" in meta for meta in mail.fake.metas)
     assert again.meta["ravn/idempotency-replayed"] is True
     assert again.meta["ravn/call-id"] == first.meta["ravn/call-id"]
     assert "not retained" in again.content[0].text and "dana@example.com" not in str(again)
-    status = await call_status(gmail, first.meta["ravn/call-id"])
+    status = await call_status(mail, first.meta["ravn/call-id"])
     assert status["status"] == "succeeded" and "idempotency" not in json.dumps(status)
 
 
-async def test_same_key_with_different_content_conflicts(gmail):
-    async with gmail.mcp(gmail.runtime) as mcp:
+async def test_same_key_with_different_content_conflicts(mail):
+    async with mail.mcp(mail.runtime) as mcp:
         await draft(mcp, key="draft-1042-b")
         data = await refused(mcp, key="draft-1042-b", arguments={**DRAFT, "body": "Changed."})
     assert data["code"] == "idempotency_conflict"
-    assert len(gmail.fake.calls) == 1
+    assert len(mail.fake.calls) == 1
 
 
-async def test_concurrent_duplicates_dispatch_once(gmail):
-    gmail.fake.block_list = True
+async def test_concurrent_duplicates_dispatch_once(mail):
+    mail.fake.block_list = True
 
     async def attempt():
-        async with gmail.mcp(gmail.runtime) as mcp:
+        async with mail.mcp(mail.runtime) as mcp:
             try:
                 return await draft(mcp, key="draft-1042-c")
             except MCPError as error:
@@ -215,10 +199,10 @@ async def test_concurrent_duplicates_dispatch_once(gmail):
     tasks = [asyncio.create_task(attempt()) for _ in range(2)]
     # Both requests pass the early key check before either reaches admission.
     async with asyncio.timeout(5):
-        await gmail.fake.both_listing.wait()
-    gmail.fake.release.set()
+        await mail.fake.both_listing.wait()
+    mail.fake.release.set()
     outcomes = await asyncio.gather(*tasks)
-    assert len(gmail.fake.calls) == 1
+    assert len(mail.fake.calls) == 1
     # The loser either sees the call still running or replays its known outcome.
     losers = [
         o for o in outcomes if o == "call_in_progress" or o.meta.get("ravn/idempotency-replayed")
@@ -226,32 +210,32 @@ async def test_concurrent_duplicates_dispatch_once(gmail):
     assert len(losers) == 1, outcomes
 
 
-async def test_lost_reply_is_unknown_and_never_redispatched(gmail):
-    gmail.fake.lose_response = True
-    async with gmail.mcp(gmail.runtime) as mcp:
+async def test_lost_reply_is_unknown_and_never_redispatched(mail):
+    mail.fake.lose_response = True
+    async with mail.mcp(mail.runtime) as mcp:
         data = await refused(mcp, key="draft-1042-d")
         assert data["code"] == "outcome_unknown" and data["retryable"] is False
         call_id = data["details"]["call_id"]
-        gmail.fake.lose_response = False
+        mail.fake.lose_response = False
         replay = await refused(mcp, key="draft-1042-d")
         assert replay["code"] == "outcome_unknown" and replay["details"]["call_id"] == call_id
-        assert len(gmail.fake.calls) == 1
+        assert len(mail.fake.calls) == 1
         # Without a key, a resubmission is a new action and can execute again.
         await draft(mcp)
-    assert len(gmail.fake.calls) == 2
-    status = await call_status(gmail, call_id)
+    assert len(mail.fake.calls) == 2
+    status = await call_status(mail, call_id)
     assert (status["status"], status["error_code"]) == ("unknown", "outcome_unknown")
 
 
-async def test_definite_provider_refusal_fails_and_releases_the_key(gmail):
-    gmail.fake.deny_next = True
-    async with gmail.mcp(gmail.runtime) as mcp:
+async def test_definite_provider_refusal_fails_and_releases_the_key(mail):
+    mail.fake.deny_next = True
+    async with mail.mcp(mail.runtime) as mcp:
         data = await refused(mcp, key="draft-1042-e")
         assert data["code"] == "provider_denied"
-        assert (await call_status(gmail, data["details"]["call_id"]))["status"] == "failed"
+        assert (await call_status(mail, data["details"]["call_id"]))["status"] == "failed"
         result = await draft(mcp, key="draft-1042-e")
-    assert not result.is_error and len(gmail.fake.calls) == 1
-    connections = await gmail.http.get("/v1/connections", headers=gmail.headers())
+    assert not result.is_error and len(mail.fake.calls) == 1
+    connections = await mail.http.get("/v1/connections", headers=mail.headers())
     assert connections.json()["data"][0]["status"] == "active"
 
 
@@ -273,93 +257,10 @@ async def test_definite_provider_refusal_fails_and_releases_the_key(gmail):
         ("create_draft", {"to": ["dana@example.com"]}, "invalid_arguments"),
     ],
 )
-async def test_unreviewed_writes_and_rich_fields_never_reach_gmail(gmail, name, arguments, code):
-    async with gmail.mcp(gmail.runtime) as mcp:
+async def test_unknown_tools_and_invalid_arguments_never_reach_provider(
+    mail, name, arguments, code
+):
+    async with mail.mcp(mail.runtime) as mcp:
         data = await refused(mcp, name=name, arguments=arguments)
     assert data["code"] == code
-    assert gmail.fake.calls == []
-
-
-@asynccontextmanager
-async def operator(service):
-    """A console client for this deployment, as the Permissions tab is."""
-    state = Console(service)
-    async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=create_console_app(state)), base_url=state.origin
-    ) as http:
-        ticket = parse_qs(urlsplit(state.ticket()["url"]).fragment)["ticket"][0]
-        response = await http.post(
-            PREFIX + "/auth/exchange", headers={"Origin": state.origin}, json={"ticket": ticket}
-        )
-        http.headers.update({"Origin": state.origin, "X-CSRF-Token": response.json()["csrf_token"]})
-        yield http
-    state.close()
-
-
-async def set_draft(http, session_id, allowed):
-    response = await http.put(
-        PREFIX + f"/sessions/{session_id}/permissions",
-        json={"app_id": "demo", "tenant_id": "default", "tools": {"create_draft": allowed}},
-    )
-    assert response.status_code == 200, response.text
-    return {p["name"]: p["allowed"] for p in response.json()["permissions"]}
-
-
-async def test_a_write_survives_being_denied_and_allowed_again(gmail):
-    """Re-allowing a write tool restores it; a denial leaves nothing stuck behind."""
-    async with operator(gmail.service) as http:
-        sid = gmail.runtime["id"]
-        async with gmail.mcp(gmail.runtime) as mcp:
-            await draft(mcp)
-        assert len(gmail.fake.calls) == 1
-
-        assert (await set_draft(http, sid, False))["create_draft"] is False
-        async with gmail.mcp(gmail.runtime) as mcp:
-            assert (await refused(mcp))["code"] == "permission_denied"
-        assert len(gmail.fake.calls) == 1, "a denied write still reached Gmail"
-
-        assert (await set_draft(http, sid, True))["create_draft"] is True
-        async with gmail.mcp(gmail.runtime) as mcp:
-            assert "create_draft" in {t.name for t in (await mcp.list_tools()).tools}
-            await draft(mcp)
-        assert len(gmail.fake.calls) == 2, "the write did not recover after being re-allowed"
-
-
-async def test_the_cycle_holds_on_one_long_lived_connection(gmail):
-    """An agent keeps one MCP session open across an operator's changes."""
-    async with operator(gmail.service) as http:
-        sid = gmail.runtime["id"]
-        async with gmail.mcp(gmail.runtime) as mcp:
-            await draft(mcp)
-            await set_draft(http, sid, False)
-            assert (await refused(mcp))["code"] == "permission_denied"
-            await set_draft(http, sid, True)
-            await draft(mcp)
-    assert len(gmail.fake.calls) == 2
-
-
-async def test_repeated_toggling_settles_on_the_last_decision(gmail):
-    async with operator(gmail.service) as http:
-        sid = gmail.runtime["id"]
-        for allowed in (False, True, False, True, False):
-            await set_draft(http, sid, allowed)
-        async with gmail.mcp(gmail.runtime) as mcp:
-            assert (await refused(mcp))["code"] == "permission_denied"
-        assert (await set_draft(http, sid, True))["create_draft"] is True
-        async with gmail.mcp(gmail.runtime) as mcp:
-            await draft(mcp)
-    assert len(gmail.fake.calls) == 1
-
-
-async def test_a_denied_write_does_not_consume_its_idempotency_key(gmail):
-    """Otherwise a refusal would poison the key and block the retry after re-allowing."""
-    async with operator(gmail.service) as http:
-        sid = gmail.runtime["id"]
-        await set_draft(http, sid, False)
-        async with gmail.mcp(gmail.runtime) as mcp:
-            assert (await refused(mcp, key="draft-77"))["code"] == "permission_denied"
-        await set_draft(http, sid, True)
-        async with gmail.mcp(gmail.runtime) as mcp:
-            result = await draft(mcp, key="draft-77")
-    assert gmail.fake.calls == [("create_draft", DRAFT)]
-    assert result.meta.get("ravn/idempotency-replayed") is not True
+    assert mail.fake.calls == []

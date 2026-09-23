@@ -3,7 +3,6 @@
 import asyncio
 import contextlib
 import hmac
-import json
 import logging
 import re
 import time
@@ -14,17 +13,17 @@ from datetime import UTC, datetime, timedelta
 from mcp import types
 
 from ravn import control
+from ravn.applications import Applications
+from ravn.catalogue import schema_hash, tool_name, validate_tools
 from ravn.common import Principal, RavnError, canonical, digest, identifier, now, token
 from ravn.config import Config
 from ravn.crypto import Cipher
-from ravn.github import GitHub
-from ravn.gmail import Gmail
-from ravn.manifest import check_schema, is_write, schema_hash, schemas_for, validate_arguments
+from ravn.integrations import Integrations
 from ravn.oauth import Onboarding
-from ravn.permissions import effective_tools, session_rules
-from ravn.slack import Slack
+from ravn.provider import RemoteMCP
 from ravn.store import Store, event, finish, one, rows
 
+MAX_SESSION_CONNECTIONS = 8
 ACTOR = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:@/-]{0,127}$")
 # Provider answers that prove a dispatched request was refused, not executed.
 DEFINITE_REFUSALS = {"credential_invalid", "provider_denied"}
@@ -55,7 +54,13 @@ CONNECTION_FIELDS = (
 
 
 def public_connection(row):
-    return {**{k: row[k] for k in CONNECTION_FIELDS}, "owner_kind": "user", "restrictions": None}
+    return {
+        **{k: row[k] for k in CONNECTION_FIELDS},
+        "provider_account_id": row["provider_account_id"] or None,
+        "display_name": row["label"] or row["display_name"],
+        "owner_kind": "user",
+        "reconnect_supported": bool(row["provider_account_id"]),
+    }
 
 
 def public_session(row):
@@ -66,13 +71,11 @@ def public_session(row):
         k: row[k]
         for k in (
             "id",
-            "connection_id",
-            "connection_epoch",
             "created_at",
             "expires_at",
             "revoked_at",
         )
-    } | {"status": status, "restrictions": None}
+    } | {"status": status}
 
 
 class Service:
@@ -80,21 +83,15 @@ class Service:
         self.config = config
         self.cipher = Cipher(config)
         self.store = Store(config, self.cipher)
+        self.applications = Applications(self)
+        self.integrations = Integrations(self)
         self.providers = (
-            provider
+            dict(provider)
             if isinstance(provider, dict)
-            else {
-                "github_cloud": provider
-                or GitHub(config.limits.call_timeout_seconds, config.limits.result_bytes)
-            }
+            else {(provider.integration.app_id, provider.integration.id): provider}
+            if provider
+            else {}
         )
-        self.providers.setdefault(
-            "slack", Slack(config.limits.call_timeout_seconds, config.limits.result_bytes)
-        )
-        self.providers.setdefault(
-            "gmail", Gmail(config.limits.call_timeout_seconds, config.limits.result_bytes)
-        )
-        self.provider = self.providers["github_cloud"]  # Backward-compatible test/inspection hook.
         self.oauth = Onboarding(self)
         self.oauth_sweeper = None
         self.ready = False
@@ -103,7 +100,13 @@ class Service:
 
     async def start(self):
         await self.store.open()
-        await self.oauth.cleanup()
+        try:
+            await self.applications.load()
+            await self.integrations.load()
+            await self.oauth.cleanup()
+        except BaseException:
+            await self.store.close()
+            raise
         self.oauth_sweeper = asyncio.create_task(self.oauth.sweep())
         self.ready = True
 
@@ -116,7 +119,14 @@ class Service:
         await self.store.close()
 
     def provider_for(self, integration):
-        return self.providers[integration.connector]
+        key = (integration.app_id, integration.id)
+        if key not in self.providers:
+            self.providers[key] = RemoteMCP(
+                integration,
+                self.config.limits.call_timeout_seconds,
+                self.config.limits.result_bytes,
+            )
+        return self.providers[key]
 
     @asynccontextmanager
     async def slots(self, p: Principal, connection: str):
@@ -147,7 +157,7 @@ class Service:
                 or not hmac.compare_digest(key["secret_hash"], digest(bearer))
             ):
                 raise RavnError(401, "unauthenticated", "A valid application key is required.")
-            app = self.config.app(key["app_id"])
+            app = self.applications.get(key["app_id"])
             if app is None:
                 raise RavnError(401, "unauthenticated", "Application access is disabled.")
             if user is None or not ACTOR.fullmatch(user):
@@ -176,75 +186,169 @@ class Service:
                 row["tenant_id"],
                 row["user_id"],
                 session_id=row["id"],
-                connection_id=row["connection_id"],
             )
-            await self.authorize(db, p, row["connection_id"], execute=True)
+            await self.validate_principal(db, p)
             return p
 
     async def validate_principal(self, db, p: Principal):
-        if self.config.app(p.app) is None:
+        if self.applications.get(p.app) is None:
             raise RavnError(401, "unauthenticated", "Application access is disabled.")
         if p.key_id:
             key = await one(db, "SELECT * FROM app_keys WHERE id=? AND app_id=?", (p.key_id, p.app))
             if key is None or key["revoked_at"]:
                 raise RavnError(401, "unauthenticated", "Application key is no longer active.")
-        elif not p.session_id:
+        elif p.session_id:
+            session = await one(
+                db,
+                "SELECT * FROM sessions WHERE app_id=? AND tenant_id=? AND user_id=? AND id=?",
+                (*p.namespace, p.session_id),
+            )
+            if session is None or session["revoked_at"] or session["expires_at"] <= now():
+                raise RavnError(401, "unauthenticated", "Runtime session expired or was revoked.")
+        else:
             raise RavnError(401, "unauthenticated", "Authentication is required.")
 
-    async def authorize(self, db, p: Principal, connection_id: str, *, execute=False, tool=None):
+    async def authorize(self, db, p: Principal, connection_id: str, *, execute=False):
         await self.validate_principal(db, p)
         conn = await one(
             db,
             "SELECT * FROM connections WHERE app_id=? AND tenant_id=? AND user_id=? AND id=?",
             (*p.namespace, connection_id),
         )
-        if conn is None or (p.session_id and connection_id != p.connection_id):
+        if conn is None:
             raise RavnError(404, "not_found", "Connection not found.")
-        integration = self.config.integration(p.app, conn["integration_id"])
-        if execute:
-            if conn["status"] == "reconnect_required":
-                raise RavnError(
-                    409,
-                    "connection_reauth_required",
-                    "Reconnect this account or import a new connection.",
-                )
-            if conn["status"] != "active" or integration is None or not integration.enabled:
-                raise RavnError(409, "connection_disabled", "Connection is not executable.")
         if p.session_id:
-            session = await one(
+            attached = await one(
                 db,
-                "SELECT * FROM sessions WHERE app_id=? AND tenant_id=? AND user_id=? AND id=?",
-                (*p.namespace, p.session_id),
+                "SELECT connection_epoch FROM session_connections WHERE app_id=? AND tenant_id=? AND session_id=? AND connection_id=?",
+                (p.app, p.tenant, p.session_id, connection_id),
             )
-            if (
-                session is None
-                or session["revoked_at"]
-                or session["expires_at"] <= now()
-                or session["connection_epoch"] != conn["epoch"]
-            ):
-                raise RavnError(401, "unauthenticated", "Runtime session expired or was revoked.")
-            if tool:
-                ceiling = json.loads(session["tools"])
-                if (
-                    integration is None
-                    or tool not in ceiling
-                    or ceiling[tool] != integration.schema_hashes.get(tool)
-                ):
-                    raise RavnError(
-                        403, "permission_denied", "Tool is outside this session's ceiling."
-                    )
-                # Read at call time, so an operator's change reaches a live session.
-                try:
-                    rules = await session_rules(db, p.app, p.tenant, p.session_id)
-                except Exception:
-                    raise RavnError(
-                        403, "permission_denied", "Tool permissions are unavailable."
-                    ) from None
-                if tool not in effective_tools(ceiling, integration, rules):
-                    raise RavnError(
-                        403, "permission_denied", "Tool is denied by this session's permissions."
-                    )
+            if attached is None or attached["connection_epoch"] != conn["epoch"]:
+                raise RavnError(
+                    403,
+                    "connection_not_attached",
+                    "Connection must be attached to this session with its current authorization.",
+                )
+        integration = (
+            self.executable(conn)
+            if execute
+            else self.integrations.get(p.app, conn["integration_id"])
+        )
         return conn, integration
+
+    def executable(self, conn):
+        integration = self.integrations.get(conn["app_id"], conn["integration_id"])
+        if conn["status"] == "reconnect_required":
+            raise RavnError(409, "connection_reauth_required", "Reconnect this account.")
+        if conn["status"] != "active" or not integration or not integration.enabled:
+            raise RavnError(409, "connection_disabled", "Connection is not executable.")
+        return integration
+
+    async def session_row(self, db, p, sid):
+        await self.validate_principal(db, p)
+        row = await one(
+            db,
+            "SELECT * FROM sessions WHERE app_id=? AND tenant_id=? AND user_id=? AND id=?",
+            (*p.namespace, sid),
+        )
+        if row is None:
+            raise RavnError(404, "not_found", "Session not found.")
+        return row
+
+    async def session_view(self, db, row):
+        connections = []
+        for conn in await rows(
+            db,
+            "SELECT c.*,sc.connection_epoch AS attached_epoch FROM session_connections sc JOIN connections c ON c.app_id=sc.app_id AND c.tenant_id=sc.tenant_id AND c.id=sc.connection_id WHERE sc.app_id=? AND sc.tenant_id=? AND sc.session_id=? ORDER BY c.id",
+            (row["app_id"], row["tenant_id"], row["id"]),
+        ):
+            reason = None
+            try:
+                self.executable(conn)
+                if conn["epoch"] != conn["attached_epoch"]:
+                    reason = "reattach_required"
+            except RavnError as error:
+                reason = error.code
+            connections.append(
+                public_connection(conn)
+                | {
+                    "connection_epoch": conn["attached_epoch"],
+                    "tool_prefix": conn["id"] + "__",
+                    "blocked_reason": reason,
+                }
+            )
+        return public_session(row) | {"connections": connections}
+
+    async def session(self, p, sid):
+        async with self.store.transaction() as db:
+            return await self.session_view(db, await self.session_row(db, p, sid))
+
+    async def change_attachment(self, db, session, cid, attach, **audit):
+        # Called only after the application or console authorizes this session.
+        if (
+            session["revoked_at"]
+            or session["expires_at"] <= now()
+            or not self.applications.get(session["app_id"])
+        ):
+            raise RavnError(409, "session_inactive", "Only active sessions can change connections.")
+        conn = await one(
+            db,
+            "SELECT * FROM connections WHERE app_id=? AND tenant_id=? AND user_id=? AND id=?",
+            (session["app_id"], session["tenant_id"], session["user_id"], cid),
+        )
+        if conn is None:
+            raise RavnError(404, "not_found", "Connection not found for this session's owner.")
+        key = (session["app_id"], session["tenant_id"], session["id"])
+        prior = await one(
+            db,
+            "SELECT connection_epoch FROM session_connections WHERE app_id=? AND tenant_id=? AND session_id=? AND connection_id=?",
+            (*key, cid),
+        )
+        if attach:
+            self.executable(conn)
+            if prior and prior["connection_epoch"] == conn["epoch"]:
+                return
+            count = await one(
+                db,
+                "SELECT count(*) AS n FROM session_connections WHERE app_id=? AND tenant_id=? AND session_id=?",
+                key,
+            )
+            if not prior and count["n"] >= MAX_SESSION_CONNECTIONS:
+                raise RavnError(
+                    400, "invalid_request", "A session supports at most eight connections."
+                )
+            await db.execute(
+                "INSERT INTO session_connections VALUES(?,?,?,?,?) ON CONFLICT(app_id,tenant_id,session_id,connection_id) DO UPDATE SET connection_epoch=excluded.connection_epoch",
+                (*key, cid, conn["epoch"]),
+            )
+        elif prior:
+            await db.execute(
+                "DELETE FROM session_connections WHERE app_id=? AND tenant_id=? AND session_id=? AND connection_id=?",
+                (*key, cid),
+            )
+        else:
+            return
+        await event(
+            db,
+            control.AuditTarget(session["app_id"], session["tenant_id"], session["user_id"]),
+            "session.connection_attached" if attach else "session.connection_removed",
+            session["id"] + ":" + cid,
+            **audit,
+        )
+
+    async def set_session_connection(self, p, sid, cid, attach, request_id):
+        async with self.store.transaction() as db:
+            row = await self.session_row(db, p, sid)
+            await self.change_attachment(
+                db,
+                row,
+                cid,
+                attach,
+                actor_kind="application_key",
+                actor_id=p.key_id,
+                request_id=request_id,
+            )
+            return await self.session_view(db, row)
 
     async def credential(self, p: Principal, connection_id: str):
         return await self.oauth.credential(p, connection_id)
@@ -252,7 +356,7 @@ class Service:
     async def import_connection(
         self, p: Principal, integration_id: str, credential: str, label=None
     ):
-        integration = self.config.integration(p.app, integration_id)
+        integration = self.integrations.get(p.app, integration_id)
         if integration is None:
             raise RavnError(404, "not_found", "Integration not found.")
         if not integration.enabled:
@@ -265,6 +369,8 @@ class Service:
         cipher = self.cipher.encrypt(credential, p.app, p.tenant, cid)
         async with self.store.transaction() as db:
             await self.validate_principal(db, p)
+            if not self.integrations.get(p.app, integration_id).enabled:
+                raise RavnError(409, "connection_disabled", "Integration is disabled.")
             await db.execute(
                 "INSERT INTO connections(id,app_id,tenant_id,user_id,integration_id,provider_account_id,"
                 "display_name,label,status,ciphertext,key_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -309,31 +415,69 @@ class Service:
                 raise
             async with self.store.transaction() as db:
                 await self.authorize(db, p, cid, execute=True)
-                if p.session_id:
-                    session = await one(
-                        db,
-                        "SELECT tools FROM sessions WHERE app_id=? AND tenant_id=? AND id=?",
-                        (p.app, p.tenant, p.session_id),
-                    )
-                    ceiling = json.loads(session["tools"])
-                    rules = await session_rules(db, p.app, p.tenant, p.session_id)
-                    allowed = set(effective_tools(ceiling, integration, rules))
-                    tools = [t for t in tools if t.name in allowed]
             return tools
+
+    async def session_tools(self, p):
+        async with self.store.transaction() as db:
+            await self.validate_principal(db, p)
+            attached = await rows(
+                db,
+                "SELECT connection_id,connection_epoch FROM session_connections WHERE app_id=? AND tenant_id=? AND session_id=? ORDER BY connection_id",
+                (p.app, p.tenant, p.session_id),
+            )
+        results = await asyncio.gather(
+            *(self.discover(p, a["connection_id"]) for a in attached), return_exceptions=True
+        )
+        tools, unavailable = [], []
+        async with self.store.transaction() as db:
+            await self.validate_principal(db, p)
+            for binding, result in zip(attached, results, strict=True):
+                cid = binding["connection_id"]
+                try:
+                    conn, _ = await self.authorize(db, p, cid, execute=True)
+                    if conn["epoch"] != binding["connection_epoch"]:
+                        raise RavnError(
+                            409, "connection_changed", "Connection changed during discovery."
+                        )
+                    if isinstance(result, BaseException):
+                        raise result
+                except RavnError as error:
+                    unavailable.append({"connection_id": cid, "code": error.code})
+                    continue
+                for tool in result:
+                    tools.append(
+                        tool.model_copy(
+                            update={
+                                "name": tool_name(cid, tool.name),
+                                "title": tool.title or tool.name,
+                                "meta": {
+                                    **(tool.meta or {}),
+                                    "ravn/connection-id": cid,
+                                    "ravn/tool-name": tool.name,
+                                },
+                            }
+                        )
+                    )
+        tools = validate_tools(tools)
+        if (
+            len(
+                canonical(
+                    [t.model_dump(mode="json", by_alias=True, exclude_none=True) for t in tools]
+                )
+            )
+            > self.config.limits.result_bytes
+        ):
+            raise RavnError(502, "schema_rejected", "Combined catalogue exceeds the result limit.")
+        return types.ListToolsResult(
+            tools=tools, meta={"ravn/unavailable-connections": unavailable}
+        )
 
     async def inspect_connection(self, p, cid):
         async with self.slots(p, cid):
             credential, integration = await self.credential(p, cid)
             tools = await self.provider_for(integration).inspect(credential)
             result = {"schema_hashes": {}, "schemas_for_review": {}}
-            for tool in tools:
-                if tool.name not in schemas_for(integration.connector):
-                    continue
-                check_schema(tool.input_schema)
-                if tool.output_schema is not None:
-                    check_schema(tool.output_schema)
-                if tool.name in result["schema_hashes"]:
-                    raise RavnError(502, "schema_rejected", "Duplicate upstream tool name.")
+            for tool in validate_tools(tools):
                 result["schema_hashes"][tool.name] = schema_hash(tool)
                 result["schemas_for_review"][tool.name] = {
                     "input": tool.input_schema,
@@ -345,19 +489,16 @@ class Service:
                 await self.authorize(db, p, cid, execute=True)
             return result
 
-    async def create_session(self, p, cid, ttl=None):
+    async def create_session(self, p, connection_ids, ttl=None):
         ttl = self.config.sessions.default_ttl_seconds if ttl is None else ttl
         if not 60 <= ttl <= self.config.sessions.max_ttl_seconds:
             raise RavnError(
                 400, "invalid_request", "Requested lifetime exceeds the configured bounds."
             )
-        tools = await self.discover(p, cid)
-        if not tools:
-            raise RavnError(
-                409,
-                "integration_not_ready",
-                "No reviewed tools are available; inspect and pin schemas first.",
-            )
+        if len(connection_ids) > MAX_SESSION_CONNECTIONS or len(set(connection_ids)) != len(
+            connection_ids
+        ):
+            raise RavnError(400, "invalid_request", "Choose at most eight distinct connections.")
         value = token("sess")
         sid = "sess_" + value.split("_", 3)[2]
         expiry = (
@@ -366,40 +507,26 @@ class Service:
             .replace("+00:00", "Z")
         )
         async with self.store.transaction() as db:
-            conn, integration = await self.authorize(db, p, cid, execute=True)
-            ceiling = {t.name: integration.schema_hashes[t.name] for t in tools}
+            await self.validate_principal(db, p)
             await db.execute(
-                "INSERT INTO sessions VALUES(?,?,?,?,?,?,?,?,?,?,?,NULL)",
-                (
-                    sid,
-                    *p.namespace,
-                    cid,
-                    conn["epoch"],
-                    p.key_id,
-                    digest(value),
-                    json.dumps(ceiling),
-                    now(),
-                    expiry,
-                ),
+                "INSERT INTO sessions VALUES(?,?,?,?,?,?,?,?,NULL)",
+                (sid, *p.namespace, p.key_id, digest(value), now(), expiry),
             )
+            row = await self.session_row(db, p, sid)
+            for cid in connection_ids:
+                await self.change_attachment(
+                    db, row, cid, True, actor_kind="application_key", actor_id=p.key_id
+                )
             await event(db, p, "session.created", sid)
-        return {
-            "id": sid,
+            result = await self.session_view(db, row)
+        return result | {
             "token": value,
             "mcp_url": self.config.server.public_url.rstrip("/") + "/mcp",
-            "expires_at": expiry,
         }
 
     async def revoke_session(self, p, sid):
         async with self.store.transaction() as db:
-            await self.validate_principal(db, p)
-            row = await one(
-                db,
-                "SELECT * FROM sessions WHERE app_id=? AND tenant_id=? AND user_id=? AND id=?",
-                (*p.namespace, sid),
-            )
-            if row is None:
-                raise RavnError(404, "not_found", "Session not found.")
+            row = await self.session_row(db, p, sid)
             await control.revoke_session(db, p, row)
             return public_session(row)
 
@@ -478,8 +605,6 @@ class Service:
                 )
                 if conn is None:
                     return
-                integration = self.config.integration(p.app, conn["integration_id"])
-                connector = integration.connector if integration else "github_cloud"
                 fingerprint = self.cipher.fingerprint([*p.namespace, cid, name, arguments])
                 stamp = now()
                 await db.execute(
@@ -501,17 +626,21 @@ class Service:
                         stamp,
                         stamp,
                         stamp,
-                        "write" if is_write(name, connector) else "read",
+                        "unknown",
                         None,
                     ),
                 )
         except Exception:
             logging.getLogger("ravn").warning("Could not record a denial for %s", name)
 
-    async def execute(self, p, cid, name, arguments, request_id, idempotency_key=None):
+    async def execute(
+        self, p, cid, name, arguments, request_id, idempotency_key=None, *, routed=False
+    ):
         """Run a tool call, recording any refusal that reaches the caller."""
         try:
-            return await self._execute(p, cid, name, arguments, request_id, idempotency_key)
+            return await self._execute(
+                p, cid, name, arguments, request_id, idempotency_key, routed=routed
+            )
         except Replayed:
             raise
         except RavnError as error:
@@ -520,11 +649,11 @@ class Service:
                 await self.record_denial(p, cid, name, arguments, error.code, request_id)
             raise
 
-    async def _execute(self, p, cid, name, arguments, request_id, idempotency_key=None):
+    async def _execute(
+        self, p, cid, name, arguments, request_id, idempotency_key=None, *, routed=False
+    ):
         async with self.store.transaction() as db:
-            _, registered = await self.authorize(db, p, cid, execute=True, tool=name)
-            validate_arguments(name, arguments, registered.connector)
-        write = is_write(name, registered.connector)
+            initial, _ = await self.authorize(db, p, cid, execute=True)
         fingerprint = self.cipher.fingerprint([*p.namespace, cid, name, arguments])
         key_hash = (
             self.cipher.fingerprint([*p.namespace, "idempotency", idempotency_key])
@@ -543,7 +672,11 @@ class Service:
             async def admit():
                 nonlocal admitted
                 async with self.store.transaction() as db:
-                    await self.authorize(db, p, cid, execute=True, tool=name)
+                    current, _ = await self.authorize(db, p, cid, execute=True)
+                    if current["epoch"] != initial["epoch"]:
+                        raise RavnError(
+                            409, "connection_changed", "Connection changed before dispatch."
+                        )
                     # Transactions are serialized, so a concurrent duplicate that
                     # passed the early check is caught here, before dispatch.
                     if key_hash and (
@@ -570,7 +703,7 @@ class Service:
                             stamp,
                             stamp,
                             None,
-                            "write" if write else "read",
+                            "unknown",
                             key_hash,
                         ),
                     )
@@ -579,7 +712,12 @@ class Service:
 
             try:
                 result = await self.provider_for(integration).call(
-                    credential, integration, name, arguments, admit
+                    credential,
+                    integration,
+                    name,
+                    arguments,
+                    admit,
+                    name_key=(lambda upstream: tool_name(cid, upstream)) if routed else None,
                 )
                 if not admitted:
                     raise RuntimeError("Provider bypassed dispatch admission")
@@ -605,11 +743,9 @@ class Service:
                     return exc.result
                 if isinstance(exc, RavnError) and exc.code == "credential_invalid":
                     await self.oauth.rejected(p, cid, credential)
-                # After dispatch, a write only definitely did not happen when the
+                # After dispatch, an operation only definitely did not happen when the
                 # provider refused the request itself. Everything else is ambiguous.
-                ambiguous = write and not (
-                    isinstance(exc, RavnError) and exc.code in DEFINITE_REFUSALS
-                )
+                ambiguous = not (isinstance(exc, RavnError) and exc.code in DEFINITE_REFUSALS)
                 if admitted:
                     code = exc.code if isinstance(exc, RavnError) else "upstream_unavailable"
                     status = "failed"
@@ -624,7 +760,7 @@ class Service:
                     raise RavnError(
                         502,
                         "outcome_unknown",
-                        "The write may have executed. Reconcile before trying again; nothing was retried.",
+                        "The tool may have executed. Reconcile before trying again; nothing was retried.",
                         call_id=call_id,
                     ) from None
                 if isinstance(exc, RavnError):
@@ -716,7 +852,7 @@ class Service:
         sql = f"SELECT * FROM {table} WHERE app_id=? AND tenant_id=? AND user_id=?"
         params = list(p.namespace)
         if connection_id:
-            sql += " AND connection_id=?"
+            sql += " AND EXISTS (SELECT 1 FROM session_connections sc WHERE sc.app_id=sessions.app_id AND sc.tenant_id=sessions.tenant_id AND sc.session_id=sessions.id AND sc.connection_id=?)"
             params.append(connection_id)
         if last:
             sql += " AND (created_at,id)<(?,?)"
@@ -726,6 +862,10 @@ class Service:
         async with self.store.transaction() as db:
             await self.validate_principal(db, p)
             result = await rows(db, sql, params)
+            data = [
+                await self.session_view(db, row) if table == "sessions" else public_connection(row)
+                for row in result[:limit]
+            ]
         next_cursor = None
         if len(result) > limit:
             if len(self.cursors) >= 1024:
@@ -739,15 +879,14 @@ class Service:
                 connection_id,
                 (edge["created_at"], edge["id"]),
             )
-        transform = public_connection if table == "connections" else public_session
-        return {"data": [transform(row) for row in result[:limit]], "next_cursor": next_cursor}
+        return {"data": data, "next_cursor": next_cursor}
 
-    async def create_key(self, app_id, label):
-        if self.config.app(app_id) is None:
-            raise RavnError(404, "not_found", "Application not found or disabled.")
+    async def create_key(self, app_id, label, **audit):
         value, created = token("app"), now()
         kid = "key_" + value.split("_", 3)[2]
         async with self.store.transaction() as db:
+            if self.applications.get(app_id) is None:
+                raise RavnError(404, "not_found", "Application not found or disabled.")
             await db.execute(
                 "INSERT INTO app_keys VALUES(?,?,?,?,?,NULL)",
                 (kid, app_id, digest(value), label, created),
@@ -757,8 +896,7 @@ class Service:
                 control.AuditTarget(app_id),
                 "application_key.created",
                 kid,
-                actor_kind="local_operator",
-                actor_id="unix-owner",
+                **(audit or {"actor_kind": "local_operator", "actor_id": "unix-owner"}),
             )
         return {"id": kid, "app_id": app_id, "key": value, "created_at": created}
 

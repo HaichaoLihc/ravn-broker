@@ -15,13 +15,11 @@ import uvicorn
 import yaml
 
 from ravn.app import create_admin_app, create_app
+from ravn.catalogue import schema_hash, validate_tools
 from ravn.common import RavnError, canonical
-from ravn.config import load_config
+from ravn.config import IntegrationSettings, load_config
 from ravn.crypto import private_file
-from ravn.github import GitHub
-from ravn.gmail import Gmail
-from ravn.manifest import check_schema, schema_hash, schemas_for
-from ravn.slack import Slack
+from ravn.provider import RemoteMCP
 
 
 def private_write(path: Path, content: str):
@@ -40,7 +38,7 @@ def initialize(args):
     key = directory / "master.key"
     private_write(key, base64.b64encode(os.urandom(32)).decode() + "\n")
     config = {
-        "version": 1,
+        "version": 2,
         "deployment_id": "local-development",
         "server": {
             "listen": f"127.0.0.1:{args.port}",
@@ -55,19 +53,11 @@ def initialize(args):
                 "key_source": {"type": "file", "path": str(key)},
             }
         },
-        "applications": [
-            {
-                "id": args.app,
-                "tenant_mode": args.tenant_mode,
-                "return_urls": ["http://127.0.0.1:8800/return"],
-            }
-        ],
-        "integrations": [{"id": "github", "app_id": args.app, "schema_hashes": {}}],
     }
     path = directory / "ravn.yaml"
     private_write(path, yaml.safe_dump(config, sort_keys=False))
     load_config(path)
-    print(f"Created {path}. Review GitHub schema pins before issuing sessions.")
+    print(f"Created {path}. Start ravn serve --console, then open Applications to create an app.")
 
 
 class AuxiliaryServer(uvicorn.Server):
@@ -85,12 +75,10 @@ class AdminServer(AuxiliaryServer):
 
 
 async def serve(config, *, console_enabled=False, console_port=8788):
-    from ravn.console import STATIC, Console, create_console_app
+    from ravn.console import Console, create_console_app
 
     app = create_app(config)
     console = Console(app.state.service, console_port) if console_enabled else None
-    if console and not (STATIC / "index.html").is_file():
-        raise ValueError("Build the console assets first")
     host, port = config.server.listen.rsplit(":", 1)
     socket = config.server.admin_socket
     socket.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -157,14 +145,14 @@ async def serve(config, *, console_enabled=False, console_port=8788):
                 console.close()
 
 
-async def admin_request(config, path, payload):
+async def admin_request(config, path, payload=None, *, method="POST"):
     async with httpx.AsyncClient(
         transport=httpx.AsyncHTTPTransport(uds=str(config.server.admin_socket)),
         base_url="http://ravn-admin",
         trust_env=False,
         timeout=10,
     ) as client:
-        response = await client.post(path, json=payload)
+        response = await client.request(method, path, json=payload)
         if response.is_error:
             raise ValueError("Operator request failed")
         return response.json()
@@ -219,32 +207,49 @@ async def run(args):
             )
             if args.output:
                 private_write(args.output, json.dumps(result, indent=2) + "\n")
-                print(f"Saved schemas for review to {args.output}; no pins were changed.")
+                print(f"Saved provider schemas to {args.output}.")
             else:
                 print(json.dumps(result, indent=2))
             return
-        integration = config.integration(args.app, args.integration)
-        if integration is None or not integration.enabled:
+        registered = await admin_request(config, "/admin/v1/integrations", method="GET")
+        item = next(
+            (
+                i
+                for i in registered["data"]
+                if i["app_id"] == args.app and i["id"] == args.integration
+            ),
+            None,
+        )
+        if item is None or not item["enabled"]:
             raise ValueError("Integration not found or disabled")
+        integration = IntegrationSettings.model_validate(
+            {k: item[k] for k in IntegrationSettings.model_fields}
+        )
         credential = private_file(args.token_file).decode()
-        provider = {"slack": Slack, "gmail": Gmail}.get(integration.connector, GitHub)(
-            config.limits.call_timeout_seconds, config.limits.result_bytes
+        provider = RemoteMCP(
+            integration, config.limits.call_timeout_seconds, config.limits.result_bytes
         )
         await provider.identify(credential)
         tools = await provider.inspect(credential)
         result = {"schema_hashes": {}, "schemas_for_review": {}}
-        for tool in tools:
-            if tool.name in schemas_for(integration.connector):
-                check_schema(tool.input_schema)
-                if tool.output_schema is not None:
-                    check_schema(tool.output_schema)
-                result["schema_hashes"][tool.name] = schema_hash(tool)
-                result["schemas_for_review"][tool.name] = {
-                    "input": tool.input_schema,
-                    "output": tool.output_schema,
-                }
+        for tool in validate_tools(tools):
+            result["schema_hashes"][tool.name] = schema_hash(tool)
+            result["schemas_for_review"][tool.name] = {
+                "input": tool.input_schema,
+                "output": tool.output_schema,
+            }
         if credential in canonical(result).decode():
             raise ValueError("Unsafe upstream schema was withheld")
+    elif args.command == "application":
+        result = await admin_request(
+            config,
+            "/admin/v1/applications",
+            {
+                "id": args.id,
+                "tenant_mode": args.tenant_mode,
+                "return_urls": args.return_url,
+            },
+        )
     elif args.command == "app-key":
         if args.action == "create":
             result = await admin_request(
@@ -269,6 +274,7 @@ async def run(args):
                 "/v1/connections/import",
                 {
                     "integration_id": args.integration,
+                    "label": args.label,
                     "credential": {
                         "type": "bearer",
                         "token": private_file(args.token_file).decode(),
@@ -283,12 +289,21 @@ async def run(args):
             )
     elif args.command == "sessions":
         if args.action == "create":
-            payload = {"connection_id": args.connection}
+            payload = {"connection_ids": args.connection}
             if args.ttl is not None:
                 payload["ttl_seconds"] = args.ttl
             result = await backend_request(config, args, "POST", "/v1/sessions", payload)
         elif args.action == "list":
             result = await backend_request(config, args, "GET", "/v1/sessions")
+        elif args.action == "show":
+            result = await backend_request(config, args, "GET", f"/v1/sessions/{args.id}")
+        elif args.action in {"attach", "remove"}:
+            result = await backend_request(
+                config,
+                args,
+                "PUT" if args.action == "attach" else "DELETE",
+                f"/v1/sessions/{args.id}/connections/{args.connection}",
+            )
         else:
             result = await backend_request(config, args, "POST", f"/v1/sessions/{args.id}/revoke")
     elif args.command == "connect-sessions":
@@ -320,8 +335,6 @@ def parser():
         "init", help="Create owner-only local development state; refuses overwrite"
     )
     init.add_argument("--directory", type=Path, default=Path(".ravn"))
-    init.add_argument("--app", default="demo")
-    init.add_argument("--tenant-mode", choices=["single", "multi"], default="single")
     init.add_argument("--port", type=int, default=8787)
 
     def config(p):
@@ -348,12 +361,10 @@ def parser():
         action="store_true",
         help="Print the short-lived sign-in link instead of opening it",
     )
-    inspect = sub.add_parser(
-        "integration-inspect", help="Inspect candidate schemas; does not approve or save pins"
-    )
+    inspect = sub.add_parser("integration-inspect", help="Inspect the provider tool schemas")
     config(inspect)
     inspect.add_argument("--app")
-    inspect.add_argument("--integration", default="github")
+    inspect.add_argument("--integration")
     inspection_source = inspect.add_mutually_exclusive_group(required=True)
     inspection_source.add_argument("--token-file", type=Path)
     inspection_source.add_argument("--connection")
@@ -361,6 +372,12 @@ def parser():
     inspect.add_argument("--user")
     inspect.add_argument("--tenant")
     inspect.add_argument("--output", type=Path)
+    apps = sub.add_parser("application").add_subparsers(dest="action", required=True)
+    create_app = apps.add_parser("create")
+    config(create_app)
+    create_app.add_argument("--id", required=True)
+    create_app.add_argument("--tenant-mode", choices=["single", "multi"], default="single")
+    create_app.add_argument("--return-url", action="append", default=[])
     keys = sub.add_parser("app-key").add_subparsers(dest="action", required=True)
     create = keys.add_parser("create")
     config(create)
@@ -378,9 +395,10 @@ def parser():
                 "connect", help="Authorize through a browser-bound loopback helper"
             )
             actor(connect)
-            connect.add_argument("--integration", default="github")
+            connect.add_argument("--integration", required=True)
             connect.add_argument("--return-url", default="http://127.0.0.1:8800/return")
             connect.add_argument("--reconnect", help="Existing same-account connection ID")
+            connect.add_argument("--label", help="Optional name for the connected account")
             connect.add_argument("--no-open", action="store_true")
 
         actor(commands.add_parser("list"))
@@ -391,9 +409,21 @@ def parser():
         actor(create)
         if kind == "connections":
             create.add_argument("--token-file", type=Path, required=True)
-            create.add_argument("--integration", default="github")
+            create.add_argument("--integration", required=True)
+            create.add_argument("--label", help="Optional name for the connected account")
         else:
-            create.add_argument("--connection", required=True)
+            create.add_argument(
+                "--connection",
+                action="append",
+                default=[],
+                help="Repeat for each connection; omit for an empty session",
+            )
+            for action in ("show", "attach", "remove"):
+                command = commands.add_parser(action)
+                actor(command)
+                command.add_argument("id")
+                if action != "show":
+                    command.add_argument("--connection", required=True)
             create.add_argument("--ttl", type=int)
             create.add_argument("--output", type=Path)
     show = sub.add_parser("calls").add_subparsers(dest="action", required=True).add_parser("show")

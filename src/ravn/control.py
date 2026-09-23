@@ -27,11 +27,6 @@ async def disconnect(db, p, connection, **audit):
         "revision=revision+1,updated_at=? WHERE app_id=? AND tenant_id=? AND id=?",
         (now(), p.app, p.tenant, connection["id"]),
     )
-    await db.execute(
-        "UPDATE sessions SET revoked_at=COALESCE(revoked_at,?) "
-        "WHERE app_id=? AND tenant_id=? AND connection_id=?",
-        (now(), p.app, p.tenant, connection["id"]),
-    )
     from ravn.oauth import WIPE
 
     await db.execute(
@@ -50,14 +45,6 @@ async def revoke_session(db, p, session, **audit):
         (session["revoked_at"], p.app, p.tenant, session["id"]),
     )
     await event(db, p, "session.revoked", session["id"], **audit)
-
-
-async def set_permissions(db, p, session, decisions: dict, **audit):
-    """Narrow a live session's tools. Never widens it beyond its stored ceiling."""
-    from ravn.permissions import set_session_rules
-
-    await set_session_rules(db, p.app, p.tenant, session["id"], decisions)
-    await event(db, p, "session.permissions_updated", session["id"], **audit)
 
 
 async def revoke_key(db, p, key, revoke_sessions, **audit):

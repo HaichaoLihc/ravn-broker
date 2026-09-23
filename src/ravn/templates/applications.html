@@ -1,0 +1,24 @@
+<div class="table-container">
+<details class="panel" {% if not boot.applications %}open{% endif %}><summary>Create application</summary>
+  <form action="/console/api/v1/applications" method="post" data-method="POST" data-next-view="app-keys">
+    <p class="muted">Create an application, then generate a key for its backend.</p>
+    <div class="fields">{{ field('id', 'Application ID', required=true) }}
+      <label>Tenant mode<select name="tenant_mode"><option value="single">Single organization</option><option value="multi">Multiple organizations</option></select></label></div>
+    {{ field('return_urls', 'Return URLs (optional, separated by spaces)', format='words') }}
+    <p class="muted">Your application's browser return URLs after account authorization. You can add them later in Application settings.</p>
+    <button class="button primary" type="submit">Create application</button>
+  </form>
+</details>
+{% if boot.applications %}
+<table aria-label="Applications"><thead><tr><th>Application ID</th><th>Status</th><th>Integrations</th><th>Connections</th><th>Active sessions</th><th>Keys</th></tr></thead>
+<tbody>{% for a in boot.applications %}<tr>
+  <td><a class="row-link" href="{{ url(view='application',app_id=a.id) }}"><span>{{ a.id }}</span></a></td>
+  <td>{{ state('enabled' if a.enabled else 'disabled') }}</td>
+  <td><a href="{{ url(view='integrations',app_id=a.id) }}" aria-label="{{ a.id }} integrations: {{ a.integration_count }}">{{ a.integration_count }}</a></td>
+  <td><a href="{{ url(view='connections',app_id=a.id) }}" aria-label="{{ a.id }} connections: {{ a.connection_count }}">{{ a.connection_count }}</a></td>
+  <td><a href="{{ url(view='sessions',app_id=a.id,status='active') }}" aria-label="{{ a.id }} active sessions: {{ a.active_session_count }}">{{ a.active_session_count }}</a></td>
+  <td><a href="{{ url(view='app-keys',app_id=a.id) }}" aria-label="{{ a.id }} application keys">Manage keys</a></td>
+</tr>{% endfor %}</tbody></table>
+{% else %}<div class="empty"><h2>Create your first application.</h2><p>Applications, keys, and integrations are added here after the server starts.</p></div>{% endif %}
+</div>
+<footer class="list-footer"><span>{{ boot.applications | length }} application{{ '' if boot.applications | length == 1 else 's' }} · Counts include all integrations and connections. Active sessions are unexpired and not revoked.</span></footer>

@@ -1,8 +1,6 @@
 import asyncio
-import sqlite3
 import time
 from dataclasses import replace
-from importlib.resources import files
 from urllib.parse import urlsplit
 
 import httpx
@@ -12,44 +10,9 @@ from conftest import ALICE, BOB
 from ravn.app import create_admin_app
 from ravn.common import RavnError, digest
 from ravn.console import COOKIE, PREFIX, Console, create_console_app
-from ravn.service import Service
 from ravn.store import one
 
 pytestmark = pytest.mark.anyio
-
-
-async def test_schema_one_migration_preserves_history(config):
-    path = config.storage.sqlite_path
-    path.parent.mkdir(mode=0o700)
-    with sqlite3.connect(path) as db:
-        db.executescript(files("ravn").joinpath("migrations/001_initial.sql").read_text())
-        db.execute(
-            "INSERT INTO events VALUES(?,?,?,?,?,?,?)",
-            (
-                "evt_legacy",
-                "demo",
-                "default",
-                "alice",
-                "session.created",
-                "sess_old",
-                "2026-09-11T00:00:00.000000Z",
-            ),
-        )
-    service = Service(config)
-    await service.start()
-    try:
-        async with service.store.transaction() as db:
-            assert (await one(db, "PRAGMA user_version"))["user_version"] == 5
-            row = await one(db, "SELECT * FROM events WHERE id='evt_legacy'")
-            assert row["user_id"] == "alice" and row["actor_kind"] is None
-            plan = await one(
-                db,
-                "EXPLAIN QUERY PLAN SELECT * FROM events WHERE app_id=? ORDER BY created_at DESC,id DESC LIMIT 50",
-                ("demo",),
-            )
-            assert "events_app_time" in plan["detail"]
-    finally:
-        await service.close()
 
 
 async def test_local_auth_ticket_single_use_expiry_and_cookie(rig):
@@ -169,7 +132,8 @@ async def test_operator_queries_all_users_but_no_secrets(rig, console):
     session = await rig.session(alice)
     async with rig.mcp(session) as mcp:
         await mcp.call_tool(
-            "issue_read", {"owner": "acme", "repo": "demo", "method": "get", "issue_number": 1}
+            mcp.ravn_name("issue_read"),
+            {"owner": "acme", "repo": "demo", "method": "get", "issue_number": 1},
         )
     serialized = []
     for endpoint in [
@@ -212,7 +176,8 @@ async def test_details_cannot_cross_namespace(rig, console, target):
     session = await rig.session(conn, tenant="acme", key=rig.saas_key)
     async with rig.mcp(session) as mcp:
         result = await mcp.call_tool(
-            "issue_read", {"owner": "acme", "repo": "demo", "method": "get", "issue_number": 1}
+            mcp.ravn_name("issue_read"),
+            {"owner": "acme", "repo": "demo", "method": "get", "issue_number": 1},
         )
     identity = {
         "connections": conn["id"],
@@ -226,7 +191,7 @@ async def test_details_cannot_cross_namespace(rig, console, target):
         assert (await http.get(PREFIX + f"/{target}/{identity}?{params}")).status_code == 404
 
 
-async def test_operator_disconnect_uses_revision_and_revokes_sessions(rig, console):
+async def test_operator_disconnect_uses_revision_and_blocks_attachment(rig, console):
     _, http = console
     conn = await rig.connection()
     session = await rig.session(conn)
@@ -242,15 +207,13 @@ async def test_operator_disconnect_uses_revision_and_revokes_sessions(rig, conso
     detail = (
         await http.get(PREFIX + f"/sessions/{session['id']}?app_id=demo&tenant_id=default")
     ).json()
-    assert detail["status"] == "revoked" and detail["current_tools"] == []
+    assert detail["status"] == "active" and detail["broker_access"] == "blocked"
     async with rig.service.store.transaction() as db:
         row = await one(db, "SELECT ciphertext FROM connections WHERE id=?", (conn["id"],))
         assert row["ciphertext"] is None
-    assert (
-        await rig.http.post(
-            "/mcp", headers={"Authorization": "Bearer " + session["token"]}, json={}
-        )
-    ).status_code in {401, 409}
+    principal = await rig.service.authenticate_session(session["token"])
+    with pytest.raises(RavnError):
+        await rig.service.discover(principal, conn["id"])
 
 
 async def test_single_session_revoke_leaves_other_session_working(rig, console):
@@ -275,13 +238,8 @@ async def test_operator_can_reduce_access_on_disabled_app(rig, console):
     _, http = console
     conn = await rig.connection()
     session = await rig.session(conn)
-    rig.service.config = rig.service.config.model_copy(
-        update={
-            "applications": [
-                a.model_copy(update={"enabled": False}) for a in rig.service.config.applications
-            ]
-        }
-    )
+    for item in list(rig.service.applications.items.values()):
+        await rig.service.applications.save(item.model_copy(update={"enabled": False}))
     assert (await http.get(PREFIX + "/bootstrap")).json()["applications"][0]["enabled"] is False
     assert (
         await http.post(
@@ -367,17 +325,16 @@ async def test_deployment_events_do_not_leak_into_app_activity(console):
     assert deployment and all(r["app_id"] is None for r in deployment)
 
 
-async def test_original_ui_assets_served_locally_with_csp(console):
+async def test_server_rendered_console_and_local_assets(console):
     _, http = console
     response = await http.get("/console/")
     assert response.status_code == 200
     assert "script-src 'self'" in response.headers["content-security-policy"]
     assert response.headers["cache-control"] == "no-store"
-    assert (await http.get("/console/reference/database.svg")).status_code == 200
-    assert (
-        await http.get("/console/reference/a2797872-d5ec-41e6-8e2f-67f534b6588f.woff2")
-    ).status_code == 200
-    assert (await http.get("/console/reference/../../master.key")).status_code == 404
+    assert "Connections" in response.text and "No connections yet." in response.text
+    assert (await http.get("/console/static/console.css")).status_code == 200
+    assert (await http.get("/console/static/console.js")).status_code == 200
+    assert (await http.get("/console/static/../../master.key")).status_code == 404
 
 
 async def test_audit_failure_rolls_back_revocation(rig, console, monkeypatch):
@@ -408,7 +365,7 @@ async def test_console_revoke_before_admission_blocks_pending_read(rig, console)
     task = asyncio.create_task(
         rig.service.execute(
             principal,
-            principal.connection_id,
+            session["connections"][0]["id"],
             "issue_read",
             {"owner": "acme", "repo": "demo", "method": "get", "issue_number": 1},
             "req_test",

@@ -1,0 +1,10 @@
+<section><h2>{{ app_id }}</h2>
+<form action="/console/api/v1/applications/{{ app_id }}" method="post" data-method="PUT">
+  <input type="hidden" name="id" value="{{ app_id }}"><input type="hidden" name="tenant_mode" value="{{ current_app.tenant_mode }}">
+  <p class="muted">Tenant mode: {{ current_app.tenant_mode }}. This is fixed when the application is created.</p>
+  {{ field('return_urls', 'Return URLs (separated by spaces)', current_app.return_urls | join(' '), format='words') }}
+  <p class="muted">Where RAVN sends the browser after account authorization. These must exactly match your application's return handler.</p>
+  <label class="check"><input type="checkbox" name="enabled" {% if current_app.enabled %}checked{% endif %}> Application enabled</label>
+  <p class="muted">Disabling blocks new backend requests and tool calls for this application. Existing records are preserved.</p>
+  <button class="button primary" type="submit">Save application</button>
+</form></section>

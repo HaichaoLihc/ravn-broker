@@ -1,4 +1,4 @@
-"""Strict, operator-owned configuration. No dynamic provider destinations."""
+"""Strict, operator-owned integration configuration. Callers cannot choose destinations."""
 
 from pathlib import Path
 from typing import Literal
@@ -98,107 +98,97 @@ class Application(Model):
         return self
 
 
-GMAIL_READONLY = "https://www.googleapis.com/auth/gmail.readonly"
-GMAIL_COMPOSE = "https://www.googleapis.com/auth/gmail.compose"
-SLACK_SCOPES = {
-    "search:read.public",
-    "search:read.private",
-    "search:read.im",
-    "search:read.mpim",
-    "channels:history",
-    "groups:history",
-    "im:history",
-    "mpim:history",
-}
-# Each connector is one fixed provider profile; configuration selects a row and
-# can never point a connector at another destination or OAuth profile.
-CONNECTORS = {
-    "github_cloud": {
-        "endpoint": "https://api.githubcopilot.com/mcp/",
-        "manifest": "builtin:github-issues-v1",
-        "oauth_profile": "github_app_pkce",
-    },
-    "slack": {
-        "endpoint": "https://mcp.slack.com/mcp",
-        "manifest": "builtin:slack-read-v1",
-        "oauth_profile": "slack_user_confidential",
-    },
-    "gmail": {
-        "endpoint": "https://gmailmcp.googleapis.com/mcp/v1",
-        "manifest": "builtin:gmail-v1",
-        "oauth_profile": "google_web_pkce",
-    },
-}
+def https_endpoint(value: str) -> str:
+    url = urlsplit(value)
+    if (
+        len(value) > 2048
+        or any(ord(c) < 33 or ord(c) > 126 for c in value)
+        or "\\" in value
+        or url.scheme != "https"
+        or not url.hostname
+        or url.username
+        or url.password
+        or url.port not in {None, 443}
+        or url.query
+        or url.fragment
+    ):
+        raise ValueError(
+            "Provider endpoints must be HTTPS URLs on port 443 without credentials, query or fragment"
+        )
+    return value
 
 
-class OAuthConfig(Model):
-    client_id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.-]+$")
-    client_secret_file: Path
-    # GitHub requires S256. Slack's confidential server profile does not enable
-    # its irreversible public-client PKCE setting; this is not an auto-downgrade.
-    # Google web clients are confidential and also use S256.
-    profile: Literal["github_app_pkce", "slack_user_confidential", "google_web_pkce"]
-    scopes: list[str] = Field(default_factory=list, max_length=8)
+class IdentityConfig(Model):
+    endpoint: str
+    id_field: str = Field(default="sub", min_length=1, max_length=128)
+    display_field: str = Field(default="email", min_length=1, max_length=128)
+    required_claims: dict[str, str | bool] = Field(default_factory=dict, max_length=16)
 
     @model_validator(mode="after")
-    def validate_secret(self):
-        if not self.client_secret_file.is_absolute():
-            raise ValueError("OAuth client secret path must be absolute")
+    def validate_endpoint(self):
+        https_endpoint(self.endpoint)
         return self
 
 
-class Integration(Model):
-    id: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$")
-    app_id: str
-    connector: Literal["github_cloud", "slack", "gmail"] = "github_cloud"
-    transport: Literal["remote_mcp"] = "remote_mcp"
-    endpoint: Literal[
-        "https://api.githubcopilot.com/mcp/",
-        "https://mcp.slack.com/mcp",
-        "https://gmailmcp.googleapis.com/mcp/v1",
-    ] = "https://api.githubcopilot.com/mcp/"
-    enabled: bool = True
-    manifest: Literal["builtin:github-issues-v1", "builtin:slack-read-v1", "builtin:gmail-v1"] = (
-        "builtin:github-issues-v1"
+class OAuthSettings(Model):
+    client_id: str = Field(min_length=1, max_length=512)
+    authorization_endpoint: str
+    token_endpoint: str
+    issuer: str
+    resource: str | None = None
+    scopes: list[str] = Field(default_factory=list, max_length=64)
+    authorization_params: dict[str, str] = Field(default_factory=dict, max_length=16)
+    token_endpoint_auth_method: Literal["client_secret_post", "client_secret_basic", "none"] = (
+        "client_secret_post"
     )
-    schema_hashes: dict[str, str] = Field(default_factory=dict)
-    oauth: OAuthConfig | None = None
+    rotating_refresh_tokens: bool = False
 
     @model_validator(mode="after")
-    def validate_pins(self):
-        import re
-
-        from ravn.manifest import schemas_for
-
-        profile = CONNECTORS[self.connector]
-        if self.endpoint != profile["endpoint"] or self.manifest != profile["manifest"]:
+    def validate_oauth(self):
+        for value in (self.authorization_endpoint, self.token_endpoint, self.issuer):
+            https_endpoint(value)
+        if self.resource:
+            https_endpoint(self.resource)
+        if any(ord(c) < 33 or ord(c) > 126 for c in self.client_id):
+            raise ValueError("Invalid OAuth client ID")
+        if any(
+            not scope or any(ord(c) < 33 or ord(c) > 126 or c in '\\"' for c in scope)
+            for scope in self.scopes
+        ):
+            raise ValueError("Scopes must be nonempty OAuth scope strings")
+        reserved = {
+            "client_id",
+            "client_secret",
+            "redirect_uri",
+            "state",
+            "response_type",
+            "scope",
+            "code_challenge",
+            "code_challenge_method",
+            "code_verifier",
+            "resource",
+        }
+        if reserved & self.authorization_params.keys():
             raise ValueError(
-                "Connector, endpoint, and manifest must match the fixed provider profile"
+                "Extra authorization parameters cannot override OAuth security parameters"
             )
-        if not set(self.schema_hashes) <= set(schemas_for(self.connector)):
-            raise ValueError("Only the connector's reviewed tools may be pinned")
-        if any(not re.fullmatch(r"[a-f0-9]{64}", v) for v in self.schema_hashes.values()):
-            raise ValueError("Schema pins must be SHA-256 hex digests")
-        if self.oauth:
-            if self.oauth.profile != profile["oauth_profile"]:
-                raise ValueError("OAuth profile must match the connector")
-            scopes = set(self.oauth.scopes)
-            if self.connector == "gmail":
-                required = {"openid", "email", GMAIL_READONLY}
-                if not required <= scopes or not scopes <= required | {GMAIL_COMPOSE}:
-                    raise ValueError(
-                        "Gmail needs openid, email, and gmail.readonly; only gmail.compose may be added"
-                    )
-                # Compose may be granted before create_draft is reviewed, so onboarding
-                # does not need a second consent; approving the write requires it.
-                if "create_draft" in self.schema_hashes and GMAIL_COMPOSE not in scopes:
-                    raise ValueError("Approving create_draft requires the gmail.compose scope")
-            elif not scopes <= (SLACK_SCOPES if self.connector == "slack" else set()) or (
-                self.connector == "slack" and not scopes
-            ):
-                raise ValueError(
-                    "Configure only reviewed Slack read scopes; GitHub App permissions are configured at GitHub"
-                )
+        if any(len(k) > 128 or len(v) > 2048 for k, v in self.authorization_params.items()):
+            raise ValueError("OAuth authorization parameter exceeds the limit")
+        return self
+
+
+class IntegrationSettings(Model):
+    id: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$")
+    app_id: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$")
+    transport: Literal["remote_mcp"] = "remote_mcp"
+    endpoint: str
+    identity: IdentityConfig | None = None
+    enabled: bool = True
+    oauth: OAuthSettings | None = None
+
+    @model_validator(mode="after")
+    def validate_endpoint(self):
+        https_endpoint(self.endpoint)
         return self
 
 
@@ -209,24 +199,16 @@ class Limits(Model):
 
 
 class Config(Model):
-    version: Literal[1] = 1
+    version: Literal[2] = 2
     deployment_id: str = Field(min_length=1, max_length=128)
     server: ServerConfig
     storage: StorageConfig
     secrets: SecretsConfig
     sessions: SessionConfig = SessionConfig()
     limits: Limits = Limits()
-    applications: list[Application] = Field(min_length=1)
-    integrations: list[Integration] = Field(min_length=1)
 
     @model_validator(mode="after")
     def validate_namespace(self):
-        apps = [x.id for x in self.applications]
-        integrations = [(x.app_id, x.id) for x in self.integrations]
-        if len(set(apps)) != len(apps) or len(set(integrations)) != len(integrations):
-            raise ValueError("Duplicate application or integration")
-        if any(x.app_id not in apps for x in self.integrations):
-            raise ValueError("Integration references an unknown application")
         paths = [
             self.server.admin_socket,
             self.storage.sqlite_path,
@@ -237,14 +219,6 @@ class Config(Model):
         if len(set(paths)) != len(paths):
             raise ValueError("Storage, key, and socket paths must be distinct")
         return self
-
-    def app(self, app_id: str) -> Application | None:
-        return next((a for a in self.applications if a.id == app_id and a.enabled), None)
-
-    def integration(self, app_id: str, integration_id: str) -> Integration | None:
-        return next(
-            (i for i in self.integrations if i.app_id == app_id and i.id == integration_id), None
-        )
 
 
 def load_config(path: Path) -> Config:
