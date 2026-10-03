@@ -278,6 +278,44 @@ async def approvals_command(config, args):
                 print("Already decided or expired.\n")
 
 
+def render_grant(item) -> str:
+    def field(key):
+        return clean(str(item.get(key)), 256)
+
+    status = (
+        f"revoked {field('revoked_at')} ({field('revoke_reason')})"
+        if item.get("revoked_at")
+        else "active"
+    )
+    return "\n".join(
+        [
+            f"Grant {field('id')}",
+            f"  client:     {clean(str(item.get('client_name') or 'unnamed'), 128)} ({field('client_id')})",
+            f"  app:        {field('app_id')} (tenant {field('tenant_id')})",
+            f"  user:       {field('user_id')}",
+            f"  connection: {field('connection_id')}",
+            f"  created:    {field('created_at')}",
+            f"  expires:    {field('expires_at')}",
+            f"  status:     {status}",
+            f"  refreshes:  {field('rotation')}, live sessions: {field('active_sessions')}",
+        ]
+    )
+
+
+async def grants_command(config, args):
+    if args.action == "revoke":
+        await admin_request(config, f"/admin/v1/oauth-grants/{quote(args.id, safe='')}/revoke")
+        print(f"Revoked grant {clean(args.id, 256)}.")
+        return
+    result = await admin_request(
+        config, "/admin/v1/oauth-grants?all=" + ("1" if args.all else "0"), method="GET"
+    )
+    if not result["items"]:
+        print("No agent grants." if args.all else "No active agent grants.")
+    for item in result["items"]:
+        print(render_grant(item) + "\n")
+
+
 async def backend_request(config, args, method, path, payload=None):
     headers = {
         "Authorization": "Bearer " + private_file(args.app_key_file).decode(),
@@ -320,6 +358,9 @@ async def run(args):
         return
     if args.command == "approvals":
         await approvals_command(config, args)
+        return
+    if args.command == "grants":
+        await grants_command(config, args)
         return
     if args.command == "integration-inspect":
         if args.connection:
@@ -467,6 +508,16 @@ def parser():
         child = acts.add_parser(action)
         child.add_argument("--config", type=Path, default=argparse.SUPPRESS)
         if action != "list":
+            child.add_argument("id")
+    grants = sub.add_parser("grants", help="List or revoke agent (MCP OAuth) grants")
+    config(grants)
+    grant_acts = grants.add_subparsers(dest="action", required=True)
+    for action in ("list", "revoke"):
+        child = grant_acts.add_parser(action)
+        child.add_argument("--config", type=Path, default=argparse.SUPPRESS)
+        if action == "list":
+            child.add_argument("--all", action="store_true", help="Include revoked and expired")
+        else:
             child.add_argument("id")
     inspect = sub.add_parser(
         "integration-inspect", help="Inspect candidate schemas; does not approve or save pins"

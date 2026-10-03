@@ -231,6 +231,12 @@ class ApprovalsConfig(Model):
     channel: Literal["operator", "client", "both"] = "operator"
 
 
+class McpOAuthConfig(Model):
+    # Absolute lifetime of an agent grant; refreshing never extends it.
+    refresh_ttl_seconds: int = Field(default=2592000, ge=3600, le=7776000)
+    max_clients: int = Field(default=64, ge=1, le=1024)
+
+
 class Config(Model):
     version: Literal[1] = 1
     deployment_id: str = Field(min_length=1, max_length=128)
@@ -239,6 +245,7 @@ class Config(Model):
     secrets: SecretsConfig
     sessions: SessionConfig = SessionConfig()
     approvals: ApprovalsConfig = ApprovalsConfig()
+    mcp_oauth: McpOAuthConfig = McpOAuthConfig()
     limits: Limits = Limits()
     applications: list[Application] = Field(min_length=1)
     integrations: list[Integration] = Field(min_length=1)

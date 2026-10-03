@@ -11,6 +11,9 @@ application owns user login and account-connection UI.
   Gmail API. Every send waits for a person to approve it.
 - Writes wait for a human: approve or deny each one with `ravn approvals`.
 - Local console: inspect connections, sessions, and activity; revoke access.
+- Agents sign in with MCP OAuth: add `http://127.0.0.1:8787/mcp` to Claude Code
+  or Codex and approve on the console; no token file
+  ([setup](docs/onboarding.md#5-connect-an-agent-with-mcp-oauth)).
 
 **Live provider compatibility remains unverified.** Automated tests use simulated
 providers. Gmail writes are never automatically retried.

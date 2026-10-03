@@ -1,6 +1,7 @@
 """Optional local-owner console. No application key or runtime token grants access."""
 
 import hmac
+import html
 import json
 import re
 import secrets
@@ -10,12 +11,13 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from fastapi import FastAPI, Request
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import Field
 from starlette.staticfiles import StaticFiles
 
 from ravn import control
-from ravn.app import Boundary, attach_errors, error_response
+from ravn.app import Boundary, attach_errors, error_response, parse_form
+from ravn.approvals import clean
 from ravn.common import RavnError, digest, identifier, now
 from ravn.config import Model
 from ravn.manifest import is_write, schemas_for
@@ -26,6 +28,12 @@ from ravn.store import event, one, rows
 PREFIX = "/console/api/v1"
 COOKIE = "ravn_operator"
 STATIC = Path(__file__).parent / "static" / "console"
+# Server-rendered pages for agent sign-in; outside PREFIX so a signed-out browser
+# gets instructions instead of a JSON 401.
+OAUTH_PAGES = "/console/oauth/"
+CONSENT = "/console/oauth/consent"
+GRANTS = "/console/oauth/grants"
+GRANTS_REVOKE = "/console/oauth/grants/revoke"
 
 
 def effect_of(integration, name: str) -> str:
@@ -76,6 +84,7 @@ class Console:
         self.service, self.port = service, port
         self.origin = f"http://127.0.0.1:{port}"
         self.tickets, self.sessions, self.cursors = {}, {}, {}
+        service.consent_url = self.origin + CONSENT
 
     def sweep(self):
         stamp = time.monotonic()
@@ -513,7 +522,9 @@ class Console:
 class ConsoleBoundary:
     def __init__(self, app, console):
         self.console = console
-        self.app = Boundary(app, console.service, admin=True)
+        self.app = Boundary(
+            app, console.service, admin=True, forms=frozenset({CONSENT, GRANTS_REVOKE})
+        )
 
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":
@@ -536,7 +547,34 @@ class ConsoleBoundary:
                     403, "permission_denied", "Cross-origin console requests are forbidden."
                 )
             path = scope["path"]
-            if path.startswith(PREFIX):
+            pages = path.startswith(OAUTH_PAGES)
+            if pages:
+                if b"authorization" in headers or any(k.startswith(b"x-ravn-") for k in headers):
+                    raise RavnError(
+                        401,
+                        "unauthenticated",
+                        "Application and runtime credentials cannot access the console.",
+                    )
+                if scope["method"] not in {"GET", "HEAD"} and origin != self.console.origin:
+                    raise RavnError(
+                        403, "permission_denied", "Console forms require a same-origin request."
+                    )
+                values = [
+                    part.strip().split("=", 1)[1]
+                    for part in headers.get(b"cookie", "").split(";")
+                    if part.strip().startswith(self.console.cookie_name + "=")
+                ]
+                if len(values) > 1:
+                    raise invalid("Repeated console cookie.")
+                operator = None
+                if values:
+                    try:
+                        operator = self.console.authenticate(values[0])
+                    except RavnError:
+                        operator = None
+                # The form posts its CSRF token as a field, checked by the route.
+                scope.setdefault("state", {})["operator"] = operator
+            elif path.startswith(PREFIX):
                 if b"authorization" in headers or any(k.startswith(b"x-ravn-") for k in headers):
                     raise RavnError(
                         401,
@@ -573,7 +611,12 @@ class ConsoleBoundary:
                                 b"content-security-policy",
                                 b"default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; object-src 'none'",
                             ),
-                            (b"referrer-policy", b"no-referrer"),
+                            # A form POST under no-referrer carries Origin: null, so the
+                            # consent pages keep the origin for same-origin requests only.
+                            (
+                                b"referrer-policy",
+                                b"same-origin" if pages else b"no-referrer",
+                            ),
                             (b"x-content-type-options", b"nosniff"),
                             (b"x-frame-options", b"DENY"),
                         ]
@@ -705,6 +748,90 @@ def create_console_app(console):
             revoke_sessions=body.revoke_sessions,
         )
 
+    def page(title, text, status=200):
+        return HTMLResponse(render_message(title, text), status_code=status)
+
+    def signed_out():
+        return page(
+            "Sign in to RAVN",
+            "Run `uv run ravn console` in a terminal to sign in to the console, "
+            "then reload this page.",
+        )
+
+    async def form(request, fields):
+        values = parse_form(await request.body())
+        if set(values) - fields:
+            raise invalid("Unsupported form field.")
+        return values
+
+    def csrf_ok(operator, values):
+        return hmac.compare_digest(values.get("csrf", "").encode(), operator.csrf.encode())
+
+    @app.get(CONSENT)
+    async def consent_page(request: Request):
+        if set(query(request)) != {"request"}:
+            return page("Restart from your agent", "This sign-in link is malformed.", 400)
+        operator = request.state.operator
+        if operator is None:
+            return signed_out()
+        try:
+            view = await console.service.mcp_oauth.pending_view(
+                operator, request.query_params["request"]
+            )
+        except RavnError as error:
+            return page("Restart from your agent", error.message, error.status)
+        return HTMLResponse(render_consent(view, operator.csrf))
+
+    @app.post(CONSENT)
+    async def consent_decision(request: Request):
+        operator = request.state.operator
+        if operator is None:
+            return page(
+                "Sign in to RAVN",
+                "Your console sign-in expired. Run `uv run ravn console`, then reload the consent page.",
+                401,
+            )
+        values = await form(request, {"request", "csrf", "connection", "decision"})
+        if not csrf_ok(operator, values):
+            return page("Request refused", "Reload the consent page and try again.", 403)
+        try:
+            url = await console.service.mcp_oauth.decide(
+                operator,
+                values.get("request"),
+                values.get("decision"),
+                values.get("connection"),
+                request.state.request_id,
+            )
+        except RavnError as error:
+            return page("Consent not recorded", error.message, error.status)
+        return RedirectResponse(url, status_code=303)
+
+    @app.get(GRANTS)
+    async def grants_page(request: Request):
+        if query(request):
+            raise invalid("Unsupported query filter.")
+        operator = request.state.operator
+        if operator is None:
+            return signed_out()
+        grants = await console.service.mcp_oauth.list_grants(include_revoked=True)
+        return HTMLResponse(render_grants(grants, operator.csrf))
+
+    @app.post(GRANTS_REVOKE)
+    async def grants_revoke(request: Request):
+        operator = request.state.operator
+        if operator is None:
+            return signed_out()
+        values = await form(request, {"grant", "csrf"})
+        if not csrf_ok(operator, values):
+            return page("Request refused", "Reload the grants page and try again.", 403)
+        try:
+            await console.service.mcp_oauth.revoke_grant_by_id(
+                values.get("grant", ""), "local_operator", operator.id, request.state.request_id
+            )
+        except RavnError as error:
+            return page("Grant not revoked", error.message, error.status)
+        return RedirectResponse(GRANTS, status_code=303)
+
     @app.get("/")
     async def root():
         return RedirectResponse("/console/")
@@ -725,3 +852,102 @@ def create_console_app(console):
             "/console/reference", StaticFiles(directory=STATIC / "reference", check_dir=False)
         )
     return app
+
+
+STYLE = """
+body{font:15px/1.5 system-ui,sans-serif;max-width:44rem;margin:2rem auto;padding:0 16px;
+color:#1d1d1f;background:#fafaf9}
+h1{font-size:1.4rem}code{background:#eee;padding:0 .3em;border-radius:3px}
+.note{color:#555;font-size:.9rem}fieldset{border:1px solid #ccc;border-radius:6px;margin:1rem 0}
+label{display:block;padding:.3rem 0}button{font:inherit;padding:.4rem 1rem;margin-right:.5rem}
+table{border-collapse:collapse;width:100%;font-size:.85rem}td,th{border-bottom:1px solid #ddd;
+padding:.3rem;text-align:left;vertical-align:top}
+@media (prefers-color-scheme:dark){body{background:#1c1c1e;color:#eee}code{background:#333}
+.note{color:#aaa}td,th{border-color:#444}}
+"""
+
+
+def text(value, limit=256) -> str:
+    """Agent- or provider-controlled text, made inert for HTML."""
+    return html.escape(clean("" if value is None else str(value), limit))
+
+
+def document(title: str, body: str) -> str:
+    return (
+        '<!doctype html><html lang="en"><head><meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width,initial-scale=1">'
+        f"<title>{html.escape(title)}</title><style>{STYLE}</style></head>"
+        f"<body>{body}</body></html>"
+    )
+
+
+def render_message(title: str, message: str) -> str:
+    return document(title, f"<h1>{html.escape(title)}</h1><p>{text(message, 1024)}</p>")
+
+
+def render_consent(view: dict, csrf: str) -> str:
+    choices = "".join(
+        # Nothing is preselected: the list spans users and tenants, so a choice is explicit.
+        f'<label><input type="radio" name="connection" value="{text(c["key"], 512)}" required>'
+        f" {text(c['display_name'])}"
+        f"{' (' + text(c['label']) + ')' if c['label'] else ''} "
+        f'<span class="note">{text(c["integration_id"])} · app {text(c["app_id"])} · '
+        f"tenant {text(c['tenant_id'])} · user {text(c['user_id'])}</span></label>"
+        for c in view["connections"]
+    )
+    if not choices:
+        choices = (
+            '<p class="note">No connection can be given to an agent yet. Connect an account '
+            "and pin its reviewed tools first.</p>"
+        )
+    return document(
+        "Allow agent access",
+        "<h1>Allow an agent to use RAVN?</h1>"
+        f"<p><strong>{text(view['client_name'] or 'Unnamed client', 128)}</strong> "
+        '<span class="note">(name is self-reported by the agent)</span></p>'
+        f'<p class="note">Client {text(view["client_id"])} · returns to '
+        f"{text(view['redirect'])} · request expires {text(view['expires_at'])}</p>"
+        "<p>The agent gets a short-lived session for one connection, limited to its reviewed "
+        "tools and any per-session rules. Writes still need approval.</p>"
+        f'<form method="post" action="{CONSENT}">'
+        f'<input type="hidden" name="request" value="{text(view["request_id"])}">'
+        f'<input type="hidden" name="csrf" value="{html.escape(csrf)}">'
+        f"<fieldset><legend>Connection</legend>{choices}</fieldset>"
+        '<button type="submit" name="decision" value="approve">Approve</button>'
+        '<button type="submit" name="decision" value="deny" formnovalidate>Deny</button>'
+        "</form>",
+    )
+
+
+def render_grants(grants: list[dict], csrf: str) -> str:
+    rows_html = "".join(
+        "<tr>"
+        f"<td>{text(g['id'])}</td>"
+        f"<td>{text(g['client_name'] or 'Unnamed client', 128)}<br>"
+        f'<span class="note">{text(g["client_id"])}</span></td>'
+        f"<td>{text(g['app_id'])} / {text(g['tenant_id'])} / {text(g['user_id'])}<br>"
+        f'<span class="note">{text(g["connection_id"])}</span></td>'
+        f"<td>{text(g['created_at'])}<br>expires {text(g['expires_at'])}</td>"
+        f"<td>{text(g['rotation'])}</td><td>{text(g['active_sessions'])}</td>"
+        + (
+            f"<td>revoked {text(g['revoked_at'])}<br>{text(g['revoke_reason'])}</td>"
+            if g["revoked_at"]
+            else f'<td><form method="post" action="{GRANTS_REVOKE}">'
+            f'<input type="hidden" name="grant" value="{text(g["id"])}">'
+            f'<input type="hidden" name="csrf" value="{html.escape(csrf)}">'
+            '<button type="submit">Revoke</button></form></td>'
+        )
+        + "</tr>"
+        for g in grants
+    )
+    return document(
+        "Agent grants",
+        "<h1>Agent grants</h1>"
+        + (
+            "<table><tr><th>Grant</th><th>Client</th><th>App / tenant / user</th>"
+            "<th>Lifetime</th><th>Refreshes</th><th>Live sessions</th><th>Status</th></tr>"
+            f"{rows_html}</table>"
+            if grants
+            else '<p class="note">No agent has been granted access.</p>'
+        ),
+    )

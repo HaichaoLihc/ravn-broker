@@ -4,7 +4,7 @@ import asyncio
 import re
 from contextlib import asynccontextmanager
 from typing import Literal
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlsplit
 
 from fastapi import FastAPI, Query, Request
 from fastapi.exceptions import RequestValidationError
@@ -15,6 +15,7 @@ from mcp.shared.exceptions import MCPError
 from pydantic import Field, SecretStr
 from starlette.responses import JSONResponse, RedirectResponse
 
+from ravn import mcp_oauth
 from ravn.approvals import ELICITATION
 from ravn.common import RavnError, identifier, strict_json
 from ravn.config import Config, Model
@@ -23,6 +24,10 @@ from ravn.service import Service
 BODY_READ_TIMEOUT_SECONDS = 10
 IDEMPOTENCY = re.compile(r"[A-Za-z0-9._:-]{8,128}")
 APPROVAL_ID = re.compile(r"apr_[0-9a-f]{32}")
+# Agent-facing authorization server endpoints (see mcp_oauth).
+OAUTH_PATHS = {"/authorize", "/token", "/register", "/revoke"}
+# Their clients parse OAuth error objects, not the RAVN envelope.
+OAUTH_JSON_PATHS = {"/token", "/revoke", "/register"}
 
 
 class Credential(Model):
@@ -66,18 +71,61 @@ class DecisionRequest(Model):
     decision: Literal["approve", "deny"]
 
 
-def error_response(error: RavnError, request_id: str):
+def error_response(error: RavnError, request_id: str, challenge: str | None = None):
     headers = {"Cache-Control": "no-store", "X-Request-Id": request_id}
     if error.status == 401:
-        headers["WWW-Authenticate"] = 'Bearer realm="ravn"'
+        headers["WWW-Authenticate"] = challenge or 'Bearer realm="ravn"'
     return JSONResponse(error.envelope(request_id), status_code=error.status, headers=headers)
+
+
+def oauth_error_response(error: RavnError, request_id: str):
+    """An OAuth-shaped error, with fixed descriptions only."""
+    if error.status == 429:
+        code = "temporarily_unavailable"
+    elif error.status >= 500:
+        code = "temporarily_unavailable"
+    else:
+        code = "invalid_request"
+    response = mcp_oauth.oauth_error(error.status, code, error.message)
+    response.headers["X-Request-Id"] = request_id
+    return response
+
+
+def render_error(error: RavnError, request_id: str, scope, service):
+    path = scope["path"]
+    if path in OAUTH_JSON_PATHS:
+        return oauth_error_response(error, request_id)
+    challenge = None
+    if path in {"/mcp", "/mcp/"}:
+        # RFC 9728 §5.1: point agents at the protected resource metadata.
+        challenge = f'Bearer resource_metadata="{mcp_oauth.prm_url(service.config)}"'
+        if any(k.lower() == b"authorization" for k, _ in scope["headers"]):
+            challenge += ', error="invalid_token"'
+    return error_response(error, request_id, challenge)
+
+
+def parse_form(raw: bytes) -> dict:
+    try:
+        pairs = parse_qsl(
+            raw.decode("utf-8"),
+            strict_parsing=True,
+            keep_blank_values=True,
+            max_num_fields=32,
+        )
+    except (ValueError, UnicodeError):
+        raise RavnError(400, "invalid_request", "Malformed form body.") from None
+    if len(pairs) != len(dict(pairs)):
+        raise RavnError(400, "invalid_request", "Repeated form field.")
+    return dict(pairs)
 
 
 class Boundary:
     """Auth on every MCP HTTP request; limits/strict parsing before framework decoding."""
 
-    def __init__(self, app, service: Service, *, admin=False):
+    def __init__(self, app, service: Service, *, admin=False, forms=frozenset()):
         self.app, self.service, self.admin = app, service, admin
+        # Paths that take a urlencoded form instead of JSON (OAuth endpoints, HTML forms).
+        self.forms = frozenset(forms)
         self.active = 0
 
     async def __call__(self, scope, receive, send):
@@ -99,7 +147,8 @@ class Boundary:
                 message["headers"].extend(
                     [(b"cache-control", b"no-store"), (b"x-request-id", request_id.encode())]
                 )
-                if scope["path"].startswith("/oauth/"):
+                path = scope["path"]
+                if path.startswith(("/oauth/", "/.well-known/")) or path in OAUTH_PATHS:
                     message["headers"].extend(
                         [
                             (b"referrer-policy", b"no-referrer"),
@@ -153,7 +202,7 @@ class Boundary:
                         403, "permission_denied", "Browser cross-origin requests are unsupported."
                     )
             path = scope["path"]
-            if path.startswith("/oauth/") and not self.service.ready:
+            if (path.startswith("/oauth/") or path in OAUTH_PATHS) and not self.service.ready:
                 raise RavnError(503, "dependency_unavailable", "RAVN is not ready.")
             if path.startswith("/v1/") or path in {"/mcp", "/mcp/"} or self.admin:
                 if not self.service.ready:
@@ -213,7 +262,16 @@ class Boundary:
                             break
             except TimeoutError:
                 raise RavnError(408, "invalid_request", "Request body read timed out.") from None
-            if body:
+            if body and path in self.forms:
+                kind, _, params = headers.get(b"content-type", "").partition(";")
+                charset = params.strip().lower()
+                if kind.strip().lower() != "application/x-www-form-urlencoded" or charset not in {
+                    "",
+                    "charset=utf-8",
+                }:
+                    raise RavnError(415, "invalid_request", "A urlencoded form is required.")
+                parse_form(bytes(body))
+            elif body:
                 if headers.get(b"content-type", "").split(";")[0].strip() != "application/json":
                     raise RavnError(415, "invalid_request", "JSON content type is required.")
                 try:
@@ -244,13 +302,15 @@ class Boundary:
         except RavnError as error:
             if started:
                 raise
-            await error_response(error, request_id)(scope, receive, send)
+            await render_error(error, request_id, scope, self.service)(scope, receive, send)
         except Exception:
             if started:
                 raise
-            await error_response(
+            await render_error(
                 RavnError(503, "dependency_unavailable", "RAVN could not complete this request."),
                 request_id,
+                scope,
+                self.service,
             )(scope, receive, send)
         finally:
             if admitted:
@@ -260,6 +320,8 @@ class Boundary:
 def attach_errors(app):
     @app.exception_handler(RavnError)
     async def ravn_error(request, error):
+        if request.url.path in OAUTH_JSON_PATHS:
+            return oauth_error_response(error, request.state.request_id)
         return error_response(error, request.state.request_id)
 
     @app.exception_handler(RequestValidationError)
@@ -354,7 +416,7 @@ def create_app(config: Config, *, provider=None) -> FastAPI:
         lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None, redirect_slashes=False
     )
     app.state.service = service
-    app.add_middleware(Boundary, service=service)
+    app.add_middleware(Boundary, service=service, forms=frozenset({"/token", "/revoke"}))
     attach_errors(app)
 
     @app.get("/healthz")
@@ -496,6 +558,7 @@ def create_app(config: Config, *, provider=None) -> FastAPI:
     async def call_status(request: Request, call_id: str):
         return await service.call_status(request.state.principal, call_id)
 
+    app.router.routes.extend(mcp_oauth.routes(service))
     # The SDK's own /mcp route remains /mcp; do not mount it at /mcp/mcp.
     app.mount("/", mcp_app)
     return app
@@ -527,5 +590,15 @@ def create_admin_app(service: Service, console=None) -> FastAPI:
     @app.post("/admin/v1/approvals/{approval_id}/decision")
     async def decide(approval_id: str, body: DecisionRequest):
         return await service.approvals.decide(approval_id, body.decision)
+
+    @app.get("/admin/v1/oauth-grants")
+    async def grants(all: bool = Query(False)):
+        return {"items": await service.mcp_oauth.list_grants(include_revoked=all)}
+
+    @app.post("/admin/v1/oauth-grants/{grant_id}/revoke")
+    async def revoke_grant(request: Request, grant_id: str):
+        return await service.mcp_oauth.revoke_grant_by_id(
+            grant_id, "local_operator", "unix-owner", request.state.request_id
+        )
 
     return app

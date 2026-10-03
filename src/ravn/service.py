@@ -22,6 +22,7 @@ from ravn.github import GitHub
 from ravn.gmail import Gmail
 from ravn.gmail_api import GmailApi
 from ravn.manifest import check_schema, is_write, schema_hash, schemas_for, validate_arguments
+from ravn.mcp_oauth import McpOAuth
 from ravn.oauth import Onboarding
 from ravn.permissions import effective_tools, session_rules
 from ravn.slack import Slack
@@ -106,20 +107,27 @@ class Service:
         self.counts = Counter()
         self.cursors = {}
         self.approvals = Approvals(self)
+        # Late-bound by the console, which hosts the consent page.
+        self.consent_url = None
+        self.mcp_oauth = McpOAuth(self)
+        self.mcp_oauth_sweeper = None
 
     async def start(self):
         await self.store.open()
         await self.approvals.recover()
         await self.oauth.cleanup()
         self.oauth_sweeper = asyncio.create_task(self.oauth.sweep())
+        await self.mcp_oauth.cleanup()
+        self.mcp_oauth_sweeper = asyncio.create_task(self.mcp_oauth.sweep())
         self.ready = True
 
     async def close(self):
         self.ready = False
-        if self.oauth_sweeper:
-            self.oauth_sweeper.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self.oauth_sweeper
+        for task in (self.oauth_sweeper, self.mcp_oauth_sweeper):
+            if task:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
         await self.store.close()
 
     def provider_for(self, integration):
@@ -195,6 +203,15 @@ class Service:
             key = await one(db, "SELECT * FROM app_keys WHERE id=? AND app_id=?", (p.key_id, p.app))
             if key is None or key["revoked_at"]:
                 raise RavnError(401, "unauthenticated", "Application key is no longer active.")
+        elif p.grant_id:
+            grant = await one(
+                db,
+                "SELECT revoked_at,expires_at FROM oauth_grants WHERE id=? AND app_id=? "
+                "AND tenant_id=? AND user_id=?",
+                (p.grant_id, *p.namespace),
+            )
+            if grant is None or grant["revoked_at"] or grant["expires_at"] <= now():
+                raise RavnError(401, "unauthenticated", "Agent grant expired or was revoked.")
         elif not p.session_id:
             raise RavnError(401, "unauthenticated", "Authentication is required.")
 
@@ -358,6 +375,12 @@ class Service:
             raise RavnError(
                 400, "invalid_request", "Requested lifetime exceeds the configured bounds."
             )
+        tools = await self.session_tools(p, cid)
+        async with self.store.transaction() as db:
+            return await self.insert_session(db, p, cid, tools, ttl)
+
+    async def session_tools(self, p, cid):
+        """The reviewed tools a new session may carry. Runs outside any transaction."""
         tools = await self.discover(p, cid)
         if not tools:
             raise RavnError(
@@ -365,6 +388,9 @@ class Service:
                 "integration_not_ready",
                 "No reviewed tools are available; inspect and pin schemas first.",
             )
+        return tools
+
+    async def insert_session(self, db, p, cid, tools, ttl, *, audit=None):
         value = token("sess")
         sid = "sess_" + value.split("_", 3)[2]
         expiry = (
@@ -372,24 +398,37 @@ class Service:
             .isoformat(timespec="microseconds")
             .replace("+00:00", "Z")
         )
-        async with self.store.transaction() as db:
-            conn, integration = await self.authorize(db, p, cid, execute=True)
-            ceiling = {t.name: integration.schema_hashes[t.name] for t in tools}
-            await db.execute(
-                "INSERT INTO sessions VALUES(?,?,?,?,?,?,?,?,?,?,?,NULL)",
-                (
-                    sid,
-                    *p.namespace,
-                    cid,
-                    conn["epoch"],
-                    p.key_id,
-                    digest(value),
-                    json.dumps(ceiling),
-                    now(),
-                    expiry,
-                ),
+        conn, integration = await self.authorize(db, p, cid, execute=True)
+        # Recomputed here: a pin can change between discovery and this transaction.
+        ceiling = {
+            t.name: integration.schema_hashes[t.name]
+            for t in tools
+            if t.name in integration.schema_hashes
+        }
+        if not ceiling:
+            raise RavnError(
+                409,
+                "integration_not_ready",
+                "No reviewed tools are available; inspect and pin schemas first.",
             )
-            await event(db, p, "session.created", sid)
+        await db.execute(
+            "INSERT INTO sessions(id,app_id,tenant_id,user_id,connection_id,connection_epoch,"
+            "issuing_key_id,token_hash,tools,created_at,expires_at,revoked_at,grant_id) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,NULL,?)",
+            (
+                sid,
+                *p.namespace,
+                cid,
+                conn["epoch"],
+                p.key_id,
+                digest(value),
+                json.dumps(ceiling),
+                now(),
+                expiry,
+                p.grant_id,
+            ),
+        )
+        await event(db, p, "session.created", sid, **(audit or {}))
         return {
             "id": sid,
             "token": value,

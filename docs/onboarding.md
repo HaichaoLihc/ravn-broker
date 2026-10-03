@@ -221,3 +221,62 @@ request for those exact arguments, once. It is, however, delivered by the
 agent's client, and a client can be configured to answer prompts itself. Use
 `operator` where the agent's machine is not trusted; the audit log records
 `agent_client` or `local_operator` as the approver.
+
+## 5. Connect an agent with MCP OAuth
+
+An MCP client that supports OAuth (Claude Code, Codex, the MCP SDKs) can sign
+in to RAVN itself, so no session token is copied into a config file. The agent's
+config holds only the URL; the client stores its tokens in its own secure
+storage and refreshes them on its own.
+
+1. Start the broker with the console: `uv run ravn serve --console`. Consent is
+   given on the console, so without it sign-in fails with
+   `temporarily_unavailable`.
+2. Add the server, using the `public_url` host exactly (`127.0.0.1`, not
+   `localhost`):
+
+   ```sh
+   claude mcp add --transport http ravn-gmail http://127.0.0.1:8787/mcp
+   ```
+
+   Then run `/mcp` in Claude Code and choose to authenticate. For Codex:
+
+   ```sh
+   codex mcp add ravn-gmail --url http://127.0.0.1:8787/mcp
+   codex mcp login ravn-gmail
+   ```
+
+3. A browser opens RAVN's consent page. If it asks you to sign in, run
+   `uv run ravn console` in a terminal, then reload the page. The page shows the
+   client's name (self-reported by the agent), the local port it returns to, and
+   the connections that can be handed to an agent: active, with an enabled
+   integration and at least one pinned tool.
+4. Choose one connection and approve. The client receives a short-lived session
+   for that connection (`sessions.default_ttl_seconds`) and a refresh token.
+
+The session works exactly like one from `ravn sessions create`: the same tool
+ceiling, per-session rules, approvals for writes, and audit log. Each refresh
+issues a new session and a new refresh token, and carries the console's
+per-session tool rules forward. The previous session runs until it expires.
+
+A grant lasts `mcp_oauth.refresh_ttl_seconds` (default 30 days) from consent and
+is not extended by refreshing; the agent then asks for consent again. RAVN
+detects refresh token reuse strictly: presenting a refresh token that was
+already used revokes the whole grant and its sessions, so two copies of one
+client refreshing at once also end the grant. Sign in again if that happens.
+
+List and revoke grants with `uv run ravn grants list [--all]` and
+`uv run ravn grants revoke <id>`, or on the console at
+`http://127.0.0.1:8788/console/oauth/grants`. Revoking a grant, revoking one of
+its sessions, the client revoking its own token, or disconnecting the connection
+all end the grant and every session issued from it. Reconnecting never revives
+a grant.
+
+Redirect URIs must be `http` loopback addresses with an explicit port. Only the
+port may differ from the registered URI, as native clients pick a free port for
+each sign-in. Scopes are accepted but grant nothing; tool access comes only from
+the ceiling and rules.
+
+OAuth removes token files and adds consent and revocation; it does not make an
+agent running as your OS user a separate principal. Such an agent can still read
+`.ravn/` and use the admin socket. Run untrusted agents as a different user.

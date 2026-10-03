@@ -103,7 +103,7 @@ class Store:
             if version["user_version"] == 0:
                 migration = files("ravn").joinpath("migrations/001_initial.sql").read_text()
                 await self.db.executescript("BEGIN IMMEDIATE;\n" + migration + "\nCOMMIT;")
-            elif version["user_version"] not in {1, 2, 3, 4, 5, 6}:
+            elif version["user_version"] not in {1, 2, 3, 4, 5, 6, 7}:
                 raise ValueError("Unsupported database schema version")
             if version["user_version"] < 2:
                 migration = files("ravn").joinpath("migrations/002_console.sql").read_text()
@@ -120,6 +120,24 @@ class Store:
             if version["user_version"] < 6:
                 migration = files("ravn").joinpath("migrations/006_approvals.sql").read_text()
                 await self.db.executescript("BEGIN IMMEDIATE;\n" + migration + "\nCOMMIT;")
+            if version["user_version"] < 7:
+                # Rebuilding sessions drops a table other tables reference. With
+                # foreign keys on, that leaves violations that fail the COMMIT, so
+                # check them explicitly instead. The pragma is a no-op in a transaction.
+                migration = files("ravn").joinpath("migrations/007_mcp_oauth.sql").read_text()
+                await self.db.execute("PRAGMA foreign_keys=OFF")
+                try:
+                    await self.db.executescript("BEGIN IMMEDIATE;\n" + migration)
+                    if await rows(self.db, "PRAGMA foreign_key_check"):
+                        await self.db.rollback()
+                        raise ValueError("Migration 7 broke foreign keys")
+                    await self.db.commit()
+                except BaseException:
+                    if self.db.in_transaction:
+                        await self.db.rollback()
+                    raise
+                finally:
+                    await self.db.execute("PRAGMA foreign_keys=ON")
             async with self.transaction() as db:
                 check = await one(db, "SELECT value FROM metadata WHERE key='key-check'")
                 if check:

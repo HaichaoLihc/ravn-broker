@@ -7,7 +7,7 @@ These helpers deliberately do not grant authority or authenticate callers.
 from dataclasses import dataclass
 
 from ravn.common import now
-from ravn.store import event
+from ravn.store import event, rows
 
 
 @dataclass(frozen=True)
@@ -38,6 +38,14 @@ async def disconnect(db, p, connection, **audit):
         f"UPDATE connect_sessions SET status='cancelled',{WIPE},updated_at=? WHERE app_id=? AND tenant_id=? AND reconnect_id=? AND status IN ('pending','authorizing','exchanging','awaiting_completion')",
         (now(), p.app, p.tenant, connection["id"]),
     )
+    # A reconnect never revives an agent grant; the agent must ask for consent again.
+    for grant in await rows(
+        db,
+        "SELECT id FROM oauth_grants WHERE app_id=? AND tenant_id=? AND connection_id=? "
+        "AND revoked_at IS NULL",
+        (p.app, p.tenant, connection["id"]),
+    ):
+        await revoke_grant(db, p, grant["id"], reason="connection_disconnected", **audit)
     await event(db, p, "connection.disconnected", connection["id"], **audit)
 
 
@@ -50,6 +58,26 @@ async def revoke_session(db, p, session, **audit):
         (session["revoked_at"], p.app, p.tenant, session["id"]),
     )
     await event(db, p, "session.revoked", session["id"], **audit)
+    # Otherwise the agent's next refresh would silently undo the revocation.
+    if session.get("grant_id"):
+        await revoke_grant(db, p, session["grant_id"], reason="session_revoked", **audit)
+
+
+async def revoke_grant(db, target, grant_id, *, reason="operator", **audit) -> bool:
+    """Revoke an agent grant and every session issued from it. Idempotent."""
+    stamp = now()
+    cursor = await db.execute(
+        "UPDATE oauth_grants SET revoked_at=?,revoke_reason=? WHERE id=? AND revoked_at IS NULL",
+        (stamp, reason, grant_id),
+    )
+    await db.execute(
+        "UPDATE sessions SET revoked_at=COALESCE(revoked_at,?) WHERE grant_id=?",
+        (stamp, grant_id),
+    )
+    if not cursor.rowcount:
+        return False
+    await event(db, target, "oauth.grant_revoked", grant_id, **audit)
+    return True
 
 
 async def set_permissions(db, p, session, decisions: dict, **audit):

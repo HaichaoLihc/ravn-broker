@@ -81,6 +81,7 @@ class Principal:
     key_id: str | None = None
     session_id: str | None = None
     connection_id: str | None = None
+    grant_id: str | None = None
 
     @property
     def namespace(self) -> tuple[str, str, str]:
