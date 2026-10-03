@@ -103,7 +103,7 @@ class Store:
             if version["user_version"] == 0:
                 migration = files("ravn").joinpath("migrations/001_initial.sql").read_text()
                 await self.db.executescript("BEGIN IMMEDIATE;\n" + migration + "\nCOMMIT;")
-            elif version["user_version"] not in {1, 2, 3, 4, 5}:
+            elif version["user_version"] not in {1, 2, 3, 4, 5, 6}:
                 raise ValueError("Unsupported database schema version")
             if version["user_version"] < 2:
                 migration = files("ravn").joinpath("migrations/002_console.sql").read_text()
@@ -116,6 +116,9 @@ class Store:
                 await self.db.executescript("BEGIN IMMEDIATE;\n" + migration + "\nCOMMIT;")
             if version["user_version"] < 5:
                 migration = files("ravn").joinpath("migrations/005_permissions.sql").read_text()
+                await self.db.executescript("BEGIN IMMEDIATE;\n" + migration + "\nCOMMIT;")
+            if version["user_version"] < 6:
+                migration = files("ravn").joinpath("migrations/006_approvals.sql").read_text()
                 await self.db.executescript("BEGIN IMMEDIATE;\n" + migration + "\nCOMMIT;")
             async with self.transaction() as db:
                 check = await one(db, "SELECT value FROM metadata WHERE key='key-check'")

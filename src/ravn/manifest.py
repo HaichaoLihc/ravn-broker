@@ -1,6 +1,7 @@
 """Reviewed per-connector tool subsets. Provider schema pins require operator review."""
 
 import hashlib
+import re
 
 from jsonschema import Draft202012Validator
 from mcp import types
@@ -135,12 +136,39 @@ GMAIL_SCHEMAS = {
 
 # Tools that change provider state. They are never retried and an ambiguous
 # outcome is recorded as unknown rather than failed.
-WRITE_TOOLS = {"gmail": {"create_draft": "Create a Gmail draft. Drafts are never sent."}}
-MANIFESTS = {"github_cloud": SCHEMAS, "slack": SLACK_SCHEMAS, "gmail": GMAIL_SCHEMAS}
+# A header value may never carry a line break, or an agent could add headers or recipients.
+HEADER_TEXT = {"type": "string", "maxLength": 998, "pattern": r"^[^\r\n]*$"}
+GMAIL_SEND_SCHEMAS = {
+    "send_email": gmail_object(
+        {
+            "to": {**RECIPIENTS, "minItems": 1},
+            "cc": RECIPIENTS,
+            "bcc": RECIPIENTS,
+            "subject": HEADER_TEXT,
+            "body": {"type": "string", "minLength": 1, "maxLength": 50000},
+        },
+        ["to", "subject", "body"],
+    ),
+}
+
+WRITE_TOOLS = {
+    "gmail": {"create_draft": "Create a Gmail draft. Drafts are never sent."},
+    "gmail_api": {
+        "send_email": "Send a plain-text email from the connected Gmail account. "
+        "A person approves each send; a sent email cannot be recalled."
+    },
+}
+MANIFESTS = {
+    "github_cloud": SCHEMAS,
+    "slack": SLACK_SCHEMAS,
+    "gmail": GMAIL_SCHEMAS,
+    "gmail_api": GMAIL_SEND_SCHEMAS,
+}
 DESCRIPTIONS = {
     "github_cloud": "Read GitHub issues using {name}.",
     "slack": "Read Slack using {name}.",
     "gmail": "Read Gmail using {name}.",
+    "gmail_api": "Use Gmail with {name}.",
 }
 
 
@@ -159,9 +187,47 @@ def schema_hash(tool: types.Tool) -> str:
     ).hexdigest()
 
 
+LOCAL_REF = re.compile(r"#/\$defs/([A-Za-z0-9_.-]{1,100})")
+
+
+def inline_local_refs(value: dict) -> dict:
+    """Resolve `#/$defs/Name` references in place, the only kind accepted.
+
+    Remote, dynamic and recursive references stay unsupported, and a node budget
+    stops a schema that fans out on expansion before it can exhaust memory.
+    """
+    defs = value.get("$defs") if isinstance(value, dict) else None
+    if not isinstance(defs, dict):
+        return value
+    budget = [20000]
+
+    def resolve(item, seen):
+        budget[0] -= 1
+        if budget[0] < 0:
+            raise RavnError(502, "schema_rejected", "Upstream tool schema exceeds the limit.")
+        if isinstance(item, list):
+            return [resolve(child, seen) for child in item]
+        if not isinstance(item, dict):
+            return item
+        ref = item.get("$ref")
+        if ref is None:
+            return {k: resolve(v, seen) for k, v in item.items()}
+        match = isinstance(ref, str) and LOCAL_REF.fullmatch(ref)
+        if not match or match[1] not in defs or match[1] in seen:
+            raise RavnError(502, "schema_rejected", "Referenced tool schemas are unsupported.")
+        target = resolve(defs[match[1]], seen | {match[1]})
+        siblings = {k: resolve(v, seen) for k, v in item.items() if k != "$ref"}
+        if not isinstance(target, dict):
+            raise RavnError(502, "schema_rejected", "Upstream tool schema is invalid.")
+        return {**target, **siblings}
+
+    return resolve({k: v for k, v in value.items() if k != "$defs"}, frozenset())
+
+
 def check_schema(value: dict, depth=0):
     if len(canonical(value)) > 262144:
         raise RavnError(502, "schema_rejected", "Upstream tool schema exceeds the limit.")
+    value = inline_local_refs(value)
 
     def visit(item, level):
         if level > 32:

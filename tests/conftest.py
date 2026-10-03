@@ -148,7 +148,7 @@ class Rig:
         return response.json()
 
     @asynccontextmanager
-    async def mcp(self, session, mode="auto"):
+    async def mcp(self, session, mode="auto", **options):
         async with httpx2.AsyncClient(
             transport=httpx2.ASGITransport(app=self.app),
             headers={"Authorization": "Bearer " + session["token"]},
@@ -157,6 +157,7 @@ class Rig:
                 streamable_http_client("http://127.0.0.1:8787/mcp", http_client=http),
                 mode=mode,
                 cache=None,
+                **options,
             ) as client:
                 yield client
 

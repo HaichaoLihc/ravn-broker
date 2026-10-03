@@ -59,6 +59,7 @@ class PinnedTransport(httpx2.AsyncBaseTransport):
             "slack.com",
             "mcp.slack.com",
             "gmailmcp.googleapis.com",
+            "gmail.googleapis.com",
             "oauth2.googleapis.com",
             "openidconnect.googleapis.com",
         }:

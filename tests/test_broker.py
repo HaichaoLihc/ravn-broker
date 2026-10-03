@@ -372,9 +372,15 @@ async def test_extension_routes_not_misrepresented_as_shipped(rig):
         "/v1/connect-sessions",
         "/v1/calls",
         "/admin/v1/app-keys",
+        "/admin/v1/approvals",
     ]:
         response = await rig.http.get(path, headers=rig.headers())
         assert response.status_code == 404
+    # Approval decisions exist only on the owner-only admin socket.
+    response = await rig.http.post(
+        "/admin/v1/approvals/apr_x/decision", headers=rig.headers(), json={"decision": "approve"}
+    )
+    assert response.status_code == 404
 
 
 async def test_foreign_call_history_hidden(rig):

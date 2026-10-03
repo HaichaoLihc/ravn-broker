@@ -39,7 +39,7 @@ async def test_schema_one_migration_preserves_history(config):
     await service.start()
     try:
         async with service.store.transaction() as db:
-            assert (await one(db, "PRAGMA user_version"))["user_version"] == 5
+            assert (await one(db, "PRAGMA user_version"))["user_version"] == 6
             row = await one(db, "SELECT * FROM events WHERE id='evt_legacy'")
             assert row["user_id"] == "alice" and row["actor_kind"] is None
             plan = await one(

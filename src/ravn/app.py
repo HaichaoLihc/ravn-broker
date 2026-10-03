@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 from typing import Literal
 from urllib.parse import urlsplit
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Query, Request
 from fastapi.exceptions import RequestValidationError
 from mcp import types
 from mcp.server import Server
@@ -15,12 +15,14 @@ from mcp.shared.exceptions import MCPError
 from pydantic import Field, SecretStr
 from starlette.responses import JSONResponse, RedirectResponse
 
+from ravn.approvals import ELICITATION
 from ravn.common import RavnError, identifier, strict_json
 from ravn.config import Config, Model
 from ravn.service import Service
 
 BODY_READ_TIMEOUT_SECONDS = 10
 IDEMPOTENCY = re.compile(r"[A-Za-z0-9._:-]{8,128}")
+APPROVAL_ID = re.compile(r"apr_[0-9a-f]{32}")
 
 
 class Credential(Model):
@@ -58,6 +60,10 @@ class KeyRequest(Model):
 
 class RevokeKeyRequest(Model):
     revoke_sessions: bool = False
+
+
+class DecisionRequest(Model):
+    decision: Literal["approve", "deny"]
 
 
 def error_response(error: RavnError, request_id: str):
@@ -288,12 +294,25 @@ def create_app(config: Config, *, provider=None) -> FastAPI:
 
     async def call_tool(ctx, params):
         try:
-            if params.task or params.input_responses or params.request_state:
+            if params.task:
                 raise RavnError(
                     400,
                     "unsupported_upstream_interaction",
-                    "Only synchronous read calls are supported.",
+                    "Only synchronous calls are supported.",
                 )
+            state = params.request_state
+            if state is not None and not APPROVAL_ID.fullmatch(state):
+                raise RavnError(400, "invalid_request", "Malformed approval state.")
+            capabilities = ctx.session.client_capabilities
+            # Only a client that can show an elicitation is asked to; its answer
+            # comes back on the retried call with the approval it was asked for.
+            prompt = (
+                (state, (params.input_responses or {}).get(ELICITATION))
+                if capabilities is not None and capabilities.elicitation is not None
+                else None
+            )
+            if state is not None and prompt is None:
+                raise RavnError(400, "invalid_request", "This client cannot answer approvals.")
             # A RAVN extension consumed here; providers only ever receive arguments.
             key = (params.meta or {}).get("ravn/idempotency-key")
             if key is not None and (not isinstance(key, str) or not IDEMPOTENCY.fullmatch(key)):
@@ -306,6 +325,7 @@ def create_app(config: Config, *, provider=None) -> FastAPI:
                 params.arguments or {},
                 ctx.request.state.request_id,
                 idempotency_key=key,
+                prompt=prompt,
             )
         except RavnError as error:
             raise MCPError(
@@ -499,5 +519,13 @@ def create_admin_app(service: Service, console=None) -> FastAPI:
     @app.post("/admin/v1/app-keys/{key_id}/revoke")
     async def revoke_key(key_id: str, body: RevokeKeyRequest):
         return await service.revoke_key(key_id, body.revoke_sessions)
+
+    @app.get("/admin/v1/approvals")
+    async def approvals(wait: int = Query(0, ge=0, le=25), after: int | None = Query(None, ge=0)):
+        return await service.approvals.pending(wait, after)
+
+    @app.post("/admin/v1/approvals/{approval_id}/decision")
+    async def decide(approval_id: str, body: DecisionRequest):
+        return await service.approvals.decide(approval_id, body.decision)
 
     return app

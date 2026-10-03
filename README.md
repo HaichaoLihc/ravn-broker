@@ -6,7 +6,10 @@ application owns user login and account-connection UI.
 
 - GitHub: read and list issues.
 - Slack: search messages and read threads.
-- Gmail: search/read mail and create drafts. Drafts are never sent.
+- Gmail: search/read mail and create drafts through Google's Gmail MCP server.
+- Gmail send (optional `gmail_api` connector): send plain-text email through the
+  Gmail API. Every send waits for a person to approve it.
+- Writes wait for a human: approve or deny each one with `ravn approvals`.
 - Local console: inspect connections, sessions, and activity; revoke access.
 
 **Live provider compatibility remains unverified.** Automated tests use simulated
