@@ -225,6 +225,10 @@ class Limits(Model):
 
 class ApprovalsConfig(Model):
     timeout_seconds: int = Field(default=300, ge=1, le=3600)
+    # operator: only `ravn approvals`. client: a prompt in the agent's own client
+    # (MCP elicitation), which that client answers. both: the client's prompt
+    # when it can show one, and the operator otherwise or when it is dismissed.
+    channel: Literal["operator", "client", "both"] = "operator"
 
 
 class Config(Model):

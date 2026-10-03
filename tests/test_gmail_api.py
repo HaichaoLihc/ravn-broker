@@ -4,12 +4,14 @@ import asyncio
 import base64
 import email
 import json
+from contextlib import asynccontextmanager
 from email.policy import default
 
 import httpx
 import httpx2
 import pytest
 from conftest import Rig
+from mcp import types
 from mcp.shared.exceptions import MCPError
 from pydantic import ValidationError
 
@@ -56,6 +58,12 @@ class FakeGoogle:
 
 @pytest.fixture
 async def gmail_api(tmp_path):
+    async with broker(tmp_path) as rig:
+        yield rig
+
+
+@asynccontextmanager
+async def broker(tmp_path, channel="operator"):
     key = tmp_path / "master.key"
     key.write_bytes(base64.b64encode(b"z" * 32))
     key.chmod(0o600)
@@ -68,6 +76,7 @@ async def gmail_api(tmp_path):
             "storage": {"sqlite_path": str(tmp_path / "state/ravn.db")},
             "secrets": {"managed": {"active_key_id": "test-key", "key_source": {"path": str(key)}}},
             "applications": [{"id": "demo"}],
+            "approvals": {"channel": channel},
             "integrations": [
                 {
                     "id": "gmail-send",
@@ -244,3 +253,126 @@ def test_send_scope_is_exact(tmp_path):
 async def test_the_schema_is_the_reviewed_contract():
     [tool] = await GmailApi().inspect(TOKEN)
     assert tool.input_schema == GMAIL_SEND_SCHEMAS["send_email"]
+
+
+class Person:
+    """Stands at the agent's client and answers RAVN's approval prompt."""
+
+    def __init__(self, action="accept"):
+        self.action, self.messages, self.schemas = action, [], []
+
+    async def __call__(self, context, params):
+        self.messages.append(params.message)
+        self.schemas.append(params.requested_schema)
+        return types.ElicitResult(
+            action=self.action, content={} if self.action == "accept" else None
+        )
+
+
+async def prompted(rig, person, arguments=EMAIL):
+    async with rig.mcp(rig.runtime, elicitation_callback=person) as mcp:
+        try:
+            return await mcp.call_tool("send_email", arguments)
+        except MCPError as error:
+            return error.data
+
+
+async def events(rig, kind):
+    async with rig.service.store.transaction() as db:
+        return await rows(db, "SELECT actor_kind FROM events WHERE kind=?", (kind,))
+
+
+async def test_the_person_at_the_client_approves_in_the_same_terminal(tmp_path):
+    async with broker(tmp_path, "both") as rig:
+        person = Person()
+        result = await finished(asyncio.create_task(prompted(rig, person)))
+        assert not result.is_error and len(rig.fake.sent) == 1
+        [message] = person.messages
+        # Accept alone approves, and what matters is on the line clients never fold.
+        assert person.schemas == [{"type": "object", "properties": {}}]
+        assert message.splitlines()[0] == (
+            'RAVN: approve send_email to dana@example.com with subject "Refund #1042"?'
+        )
+        assert "- dana@example.com" in message
+        assert "Refund #1042" in message and "It was approved." in message
+        assert [e["actor_kind"] for e in await events(rig, "approval.approved")] == ["agent_client"]
+
+
+async def test_the_person_at_the_client_denies(tmp_path):
+    async with broker(tmp_path, "both") as rig:
+        result = await finished(asyncio.create_task(prompted(rig, Person(action="decline"))))
+        assert result["code"] == "approval_denied" and rig.fake.sent == []
+
+
+async def test_a_dismissed_prompt_falls_back_to_the_operator(tmp_path):
+    async with broker(tmp_path, "both") as rig:
+        task = asyncio.create_task(prompted(rig, Person(action="cancel")))
+        await decide(rig, "approve")
+        assert not (await finished(task)).is_error and len(rig.fake.sent) == 1
+
+
+async def test_a_dismissed_prompt_denies_without_an_operator(tmp_path):
+    async with broker(tmp_path, "client") as rig:
+        result = await finished(asyncio.create_task(prompted(rig, Person(action="cancel"))))
+        assert result["code"] == "approval_denied" and rig.fake.sent == []
+
+
+async def test_client_only_refuses_a_client_that_cannot_ask(tmp_path):
+    async with broker(tmp_path, "client") as rig:
+        result = await finished(send(rig))
+        assert result["code"] == "approval_unavailable" and rig.fake.sent == []
+        async with rig.service.store.transaction() as db:
+            assert await rows(db, "SELECT id FROM approvals") == []
+
+
+async def test_both_falls_back_to_the_operator_for_a_client_that_cannot_ask(tmp_path):
+    async with broker(tmp_path, "both") as rig:
+        task = send(rig)
+        await decide(rig, "approve")
+        assert not (await finished(task)).is_error and len(rig.fake.sent) == 1
+
+
+async def test_an_answer_only_unlocks_the_call_it_was_asked_for(tmp_path):
+    async with broker(tmp_path, "both") as rig:
+        approve = {"ravn_approval": types.ElicitResult(action="accept", content={})}
+        async with rig.mcp(rig.runtime, elicitation_callback=Person()) as mcp:
+            first = await mcp.session.call_tool("send_email", EMAIL, allow_input_required=True)
+            assert first.result_type == "input_required"
+            state = first.request_state
+            # Different arguments under the same approval are refused.
+            with pytest.raises(MCPError) as error:
+                await mcp.session.call_tool(
+                    "send_email",
+                    {**EMAIL, "to": ["attacker@example.com"]},
+                    input_responses=approve,
+                    request_state=state,
+                    allow_input_required=True,
+                )
+            assert error.value.data["code"] == "approval_invalid"
+            sent = await mcp.session.call_tool(
+                "send_email", EMAIL, input_responses=approve, request_state=state
+            )
+            assert not sent.is_error
+            # A used approval cannot send again.
+            with pytest.raises(MCPError) as error:
+                await mcp.session.call_tool(
+                    "send_email", EMAIL, input_responses=approve, request_state=state
+                )
+            assert error.value.data["code"] == "approval_invalid"
+        assert len(rig.fake.sent) == 1
+
+
+async def test_operator_only_ignores_client_answers(tmp_path):
+    async with broker(tmp_path, "operator") as rig:
+        async with rig.mcp(rig.runtime, elicitation_callback=Person()) as mcp:
+            task = asyncio.create_task(mcp.call_tool("send_email", EMAIL))
+            item = await decide(rig, "deny")
+            with pytest.raises(MCPError) as error:
+                await finished(task)
+            assert error.value.data["code"] == "approval_denied"
+            with pytest.raises(MCPError) as error:
+                await mcp.session.call_tool(
+                    "send_email", EMAIL, request_state=item["id"], allow_input_required=True
+                )
+            assert error.value.data["code"] == "invalid_request"
+        assert rig.fake.sent == []

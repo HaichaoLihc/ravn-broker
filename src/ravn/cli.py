@@ -18,7 +18,7 @@ import uvicorn
 import yaml
 
 from ravn.app import create_admin_app, create_app
-from ravn.approvals import clean
+from ravn.approvals import clean, render_arguments
 from ravn.common import RavnError, canonical
 from ravn.config import load_config
 from ravn.crypto import private_file
@@ -179,46 +179,6 @@ async def admin_request(config, path, payload=None, method="POST", seconds=10):
         if response.is_error:
             raise ValueError("Operator request failed")
         return response.json()
-
-
-# Short fields that decide where a write goes come first, so a long body can
-# never push them out of view.
-FIRST = ("to", "cc", "bcc", "subject", "replyToMessageId")
-VALUE_LIMIT = 2000
-
-
-def render_arguments(raw) -> list[str]:
-    try:
-        arguments = json.loads(raw)
-    except (TypeError, ValueError):
-        arguments = None
-    if not isinstance(arguments, dict):
-        return ["    " + clean(str(raw), 4000).replace("\n", "\n    ")]
-    keys = [k for k in FIRST if k in arguments]
-    keys += sorted(k for k in arguments if k not in FIRST)
-    lines, cut = [], False
-    for key in keys:
-        value = arguments[key]
-        items = value if isinstance(value, list) else [value]
-        texts = []
-        for item in items:
-            text = item if isinstance(item, str) else json.dumps(item, ensure_ascii=False, indent=2)
-            text = clean(text, len(text))
-            # Where a write goes is never cut; the manifest already bounds those fields.
-            if key not in FIRST and len(text) > VALUE_LIMIT:
-                cut = True
-                text = f"{text[:VALUE_LIMIT]}\n... [truncated, {len(text)} chars total]"
-            texts.append(text)
-        if isinstance(value, list):
-            text = "".join("\n- " + t for t in texts) if texts else "[]"
-        else:
-            text = texts[0]
-        lines.append(f"    {clean(key, 256)}: " + text.replace("\n", "\n      "))
-    if not keys:
-        lines.append("    (none)")
-    if cut:
-        lines.append("    ! Some values are truncated; every argument is listed above.")
-    return lines
 
 
 def render(item) -> str:

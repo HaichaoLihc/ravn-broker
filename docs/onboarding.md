@@ -193,3 +193,31 @@ per-server `"timeout": 360000` (milliseconds) in its MCP config, or both
 `MCP_TOOL_TIMEOUT` and `CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT` set to `360000`. The
 idle timeout defaults to 300 seconds, the same as the approval timeout, so
 leaving it unset races the operator.
+
+#### Approving in the agent's own terminal
+
+`approvals.channel` chooses who is asked:
+
+```yaml
+approvals:
+  channel: both   # operator (default) | client | both
+```
+
+- `operator`: only `ravn approvals`, as above.
+- `client`: the agent's MCP client shows the request in its own interface
+  (an MCP elicitation) and the person there answers. A client that cannot show
+  one is refused with `approval_unavailable`; a dismissed prompt denies.
+- `both`: the client's prompt when it can show one; otherwise, or when the
+  prompt is dismissed, the request waits for `ravn approvals`. Either may decide
+  first.
+
+In Claude Code the request appears as a dialog in the same terminal, with the
+tool, recipients, subject and body, and Approve / Deny. Headless runs
+(`claude -p`) cannot show it and dismiss it. Nothing is held open while the
+person reads, so the client tool timeouts above do not apply to this path.
+
+The answer is bound like an operator's: it unlocks only that session's pending
+request for those exact arguments, once. It is, however, delivered by the
+agent's client, and a client can be configured to answer prompts itself. Use
+`operator` where the agent's machine is not trusted; the audit log records
+`agent_client` or `local_operator` as the approver.

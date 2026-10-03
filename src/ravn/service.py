@@ -515,10 +515,14 @@ class Service:
         except Exception:
             logging.getLogger("ravn").warning("Could not record a denial for %s", name)
 
-    async def execute(self, p, cid, name, arguments, request_id, idempotency_key=None):
+    async def execute(
+        self, p, cid, name, arguments, request_id, idempotency_key=None, *, prompt=None
+    ):
         """Run a tool call, recording any refusal that reaches the caller."""
         try:
-            return await self._execute(p, cid, name, arguments, request_id, idempotency_key)
+            return await self._execute(
+                p, cid, name, arguments, request_id, idempotency_key, prompt=prompt
+            )
         except Replayed:
             raise
         except RavnError as error:
@@ -527,7 +531,9 @@ class Service:
                 await self.record_denial(p, cid, name, arguments, error.code, request_id)
             raise
 
-    async def _execute(self, p, cid, name, arguments, request_id, idempotency_key=None):
+    async def _execute(
+        self, p, cid, name, arguments, request_id, idempotency_key=None, *, prompt=None
+    ):
         async with self.store.transaction() as db:
             _, registered = await self.authorize(db, p, cid, execute=True, tool=name)
             validate_arguments(name, arguments, registered.connector)
@@ -543,9 +549,9 @@ class Service:
                 replay = await self.previous_call(db, p, key_hash, fingerprint, request_id)
             if replay:
                 return replay
-        approval = (
-            await self.approvals.wait(p, cid, name, arguments, fingerprint) if write else None
-        )
+        approval = await self.approval(p, cid, name, arguments, fingerprint, write, prompt)
+        if isinstance(approval, types.InputRequiredResult):
+            return approval
         call_id, admitted, started = identifier("call"), False, time.monotonic()
         try:
             async with self.slots(p, cid):
@@ -658,6 +664,30 @@ class Service:
             # An approval is single-use: one this call did not consume dies with it.
             if approval and not admitted:
                 await quietly(self.approvals.release(p, approval))
+
+    async def approval(self, p, cid, name, arguments, fingerprint, write, prompt):
+        """Who decides a write: the operator, or the person at the agent's client.
+
+        `prompt` is None for a client that cannot show an MCP elicitation, else
+        the (approval id, answer) it returned, or (None, None) on a first call.
+        """
+        channel = self.config.approvals.channel
+        state, answer = prompt or (None, None)
+        if state is not None and (not write or channel == "operator"):
+            raise RavnError(400, "invalid_request", "No approval was requested for this call.")
+        if not write:
+            return None
+        if state is not None:
+            return await self.approvals.answer(
+                p, state, name, fingerprint, answer, fallback=channel == "both"
+            )
+        if prompt is not None and channel != "operator":
+            return await self.approvals.ask(p, cid, name, arguments, fingerprint)
+        if channel == "client":
+            raise RavnError(
+                403, "approval_unavailable", "This client cannot show an approval prompt."
+            )
+        return await self.approvals.wait(p, cid, name, arguments, fingerprint)
 
     async def finish_call(self, p, call_id, status, code, started):
         async with self.store.transaction() as db:
