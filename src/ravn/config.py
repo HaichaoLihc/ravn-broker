@@ -100,6 +100,7 @@ class Application(Model):
 
 GMAIL_READONLY = "https://www.googleapis.com/auth/gmail.readonly"
 GMAIL_COMPOSE = "https://www.googleapis.com/auth/gmail.compose"
+GMAIL_SEND = "https://www.googleapis.com/auth/gmail.send"
 SLACK_SCOPES = {
     "search:read.public",
     "search:read.private",
@@ -128,6 +129,12 @@ CONNECTORS = {
         "manifest": "builtin:gmail-v1",
         "oauth_profile": "google_web_pkce",
     },
+    # Gmail's REST API: generally available, and the only Google route that can send.
+    "gmail_api": {
+        "endpoint": "https://gmail.googleapis.com/gmail/v1",
+        "manifest": "builtin:gmail-send-v1",
+        "oauth_profile": "google_web_pkce",
+    },
 }
 
 
@@ -150,17 +157,21 @@ class OAuthConfig(Model):
 class Integration(Model):
     id: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$")
     app_id: str
-    connector: Literal["github_cloud", "slack", "gmail"] = "github_cloud"
+    connector: Literal["github_cloud", "slack", "gmail", "gmail_api"] = "github_cloud"
     transport: Literal["remote_mcp"] = "remote_mcp"
     endpoint: Literal[
         "https://api.githubcopilot.com/mcp/",
         "https://mcp.slack.com/mcp",
         "https://gmailmcp.googleapis.com/mcp/v1",
+        "https://gmail.googleapis.com/gmail/v1",
     ] = "https://api.githubcopilot.com/mcp/"
     enabled: bool = True
-    manifest: Literal["builtin:github-issues-v1", "builtin:slack-read-v1", "builtin:gmail-v1"] = (
-        "builtin:github-issues-v1"
-    )
+    manifest: Literal[
+        "builtin:github-issues-v1",
+        "builtin:slack-read-v1",
+        "builtin:gmail-v1",
+        "builtin:gmail-send-v1",
+    ] = "builtin:github-issues-v1"
     schema_hashes: dict[str, str] = Field(default_factory=dict)
     oauth: OAuthConfig | None = None
 
@@ -193,6 +204,10 @@ class Integration(Model):
                 # does not need a second consent; approving the write requires it.
                 if "create_draft" in self.schema_hashes and GMAIL_COMPOSE not in scopes:
                     raise ValueError("Approving create_draft requires the gmail.compose scope")
+            elif self.connector == "gmail_api":
+                # Send only: this connector can never read the mailbox it sends from.
+                if scopes != {"openid", "email", GMAIL_SEND}:
+                    raise ValueError("Gmail send needs exactly openid, email, and gmail.send")
             elif not scopes <= (SLACK_SCOPES if self.connector == "slack" else set()) or (
                 self.connector == "slack" and not scopes
             ):
@@ -208,6 +223,10 @@ class Limits(Model):
     call_timeout_seconds: int = Field(default=30, ge=1, le=120)
 
 
+class ApprovalsConfig(Model):
+    timeout_seconds: int = Field(default=300, ge=1, le=3600)
+
+
 class Config(Model):
     version: Literal[1] = 1
     deployment_id: str = Field(min_length=1, max_length=128)
@@ -215,6 +234,7 @@ class Config(Model):
     storage: StorageConfig
     secrets: SecretsConfig
     sessions: SessionConfig = SessionConfig()
+    approvals: ApprovalsConfig = ApprovalsConfig()
     limits: Limits = Limits()
     applications: list[Application] = Field(min_length=1)
     integrations: list[Integration] = Field(min_length=1)

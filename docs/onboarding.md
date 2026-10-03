@@ -140,3 +140,56 @@ For Gmail writes, optional MCP metadata `ravn/idempotency-key` identifies the
 same logical draft request. Without a key, repeated calls can create duplicates.
 An `outcome_unknown` error means the draft may exist; check Gmail before retrying.
 Disconnecting stops RAVN access but does not revoke the provider's OAuth grant.
+
+### Sending email
+
+Google's Gmail MCP server only drafts. To let an agent send, add a separate
+integration on the Gmail REST API, which needs no Developer Preview. Add the
+`gmail.send` scope to your OAuth consent screen, reuse the same Google client,
+and connect it like any other integration:
+
+```yaml
+  - id: gmail-send
+    app_id: demo
+    connector: gmail_api
+    endpoint: https://gmail.googleapis.com/gmail/v1
+    manifest: builtin:gmail-send-v1
+    schema_hashes: {}
+    oauth:
+      profile: google_web_pkce
+      client_id: YOUR_GOOGLE_CLIENT_ID
+      client_secret_file: /absolute/private/gmail.secret
+      scopes: [openid, email, https://www.googleapis.com/auth/gmail.send]
+```
+
+It exposes one tool, `send_email` (plain text; `to`, `cc`, `bcc`, `subject`,
+`body`), and cannot read the mailbox. A sent email cannot be recalled, so every
+send waits for approval like any other write.
+
+### Approving writes
+
+Every write tool in the manifest (Gmail `create_draft` and `send_email`) waits for a
+person before it runs. Keep `ravn approvals` open in a second terminal on the
+broker's machine; it uses the owner-only admin socket. Each request shows the
+tool, user, session and arguments, rings the bell, and asks
+`[a]pprove / [d]eny / [s]kip`. Skipped requests stay pending.
+`ravn approvals list`, `ravn approvals approve <id>` and
+`ravn approvals deny <id>` do the same without the prompt.
+
+Every argument is listed, recipients and subject first and never cut; each
+recipient is on its own line. Any other value longer than 2000 characters is
+cut with its full length shown. A session may have at most 4 requests waiting.
+
+An approval runs the arguments as the agent submitted them, once; the display
+only strips control characters and cuts long values. A denial returns
+`approval_denied` to the agent; no decision within `approvals.timeout_seconds`
+(default 300) returns `approval_expired`. Restarting the broker expires every
+pending request. Revoking the session while a request waits stops it too.
+
+Raise the agent client's tool timeout above the approval timeout, plus time for
+the provider call, or the client gives up and cancels the request: in Codex,
+`tool_timeout_sec = 360` under `[mcp_servers.<name>]`; in Claude Code, a
+per-server `"timeout": 360000` (milliseconds) in its MCP config, or both
+`MCP_TOOL_TIMEOUT` and `CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT` set to `360000`. The
+idle timeout defaults to 300 seconds, the same as the approval timeout, so
+leaving it unset races the operator.

@@ -8,6 +8,7 @@ from ravn.common import RavnError
 from ravn.config import GMAIL_COMPOSE, GMAIL_READONLY, Integration
 from ravn.github import PinnedTransport
 from ravn.gmail import Gmail
+from ravn.manifest import check_schema
 
 pytestmark = pytest.mark.anyio
 READ_SCOPES = ["openid", "email", GMAIL_READONLY]
@@ -127,10 +128,61 @@ async def test_gmail_identity_uses_stable_subject_over_openid_host():
 def test_only_googles_fixed_hosts_are_reachable():
     for host in [
         "gmailmcp.googleapis.com",
+        "gmail.googleapis.com",
         "oauth2.googleapis.com",
         "openidconnect.googleapis.com",
     ]:
         PinnedTransport(host, 1024)
-    for host in ["www.googleapis.com", "accounts.google.com", "gmail.googleapis.com"]:
+    for host in ["www.googleapis.com", "accounts.google.com", "gmail.google.com"]:
         with pytest.raises(ValueError, match="Unknown provider host"):
             PinnedTransport(host, 1024)
+
+
+# The shape Google's Gmail MCP server really answers with: shared local definitions.
+LOCAL_DEFS = {
+    "type": "object",
+    "$defs": {
+        "Attachment": {"type": "object", "properties": {"filename": {"type": "string"}}},
+        "Draft": {
+            "type": "object",
+            "properties": {
+                "attachments": {"type": "array", "items": {"$ref": "#/$defs/Attachment"}}
+            },
+        },
+    },
+    "properties": {"drafts": {"type": "array", "items": {"$ref": "#/$defs/Draft"}}},
+}
+
+
+def test_local_definitions_are_accepted():
+    check_schema(LOCAL_DEFS)
+
+
+@pytest.mark.parametrize(
+    "patch",
+    [
+        {"properties": {"x": {"$ref": "https://example.com/schema.json"}}},
+        {"properties": {"x": {"$ref": "#/$defs/Missing"}}},
+        {"properties": {"x": {"$ref": "#/properties/drafts"}}},
+        {
+            "$defs": {"Loop": {"type": "object", "properties": {"next": {"$ref": "#/$defs/Loop"}}}},
+            "properties": {"x": {"$ref": "#/$defs/Loop"}},
+        },
+        {"properties": {"x": {"$dynamicRef": "#node"}}},
+        {"$id": "https://example.com/root"},
+    ],
+)
+def test_other_references_stay_rejected(patch):
+    with pytest.raises(RavnError) as error:
+        check_schema({**LOCAL_DEFS, **patch})
+    assert error.value.code == "schema_rejected"
+
+
+def test_a_fan_out_bomb_is_refused():
+    defs = {"L0": {"type": "string"}}
+    for i in range(1, 30):
+        ref = {"$ref": f"#/$defs/L{i - 1}"}
+        defs[f"L{i}"] = {"type": "object", "properties": {"a": ref, "b": ref}}
+    with pytest.raises(RavnError) as error:
+        check_schema({"$defs": defs, "properties": {"x": {"$ref": "#/$defs/L29"}}})
+    assert error.value.code == "schema_rejected"

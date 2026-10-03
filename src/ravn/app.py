@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 from typing import Literal
 from urllib.parse import urlsplit
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Query, Request
 from fastapi.exceptions import RequestValidationError
 from mcp import types
 from mcp.server import Server
@@ -58,6 +58,10 @@ class KeyRequest(Model):
 
 class RevokeKeyRequest(Model):
     revoke_sessions: bool = False
+
+
+class DecisionRequest(Model):
+    decision: Literal["approve", "deny"]
 
 
 def error_response(error: RavnError, request_id: str):
@@ -499,5 +503,13 @@ def create_admin_app(service: Service, console=None) -> FastAPI:
     @app.post("/admin/v1/app-keys/{key_id}/revoke")
     async def revoke_key(key_id: str, body: RevokeKeyRequest):
         return await service.revoke_key(key_id, body.revoke_sessions)
+
+    @app.get("/admin/v1/approvals")
+    async def approvals(wait: int = Query(0, ge=0, le=25), after: int | None = Query(None, ge=0)):
+        return await service.approvals.pending(wait, after)
+
+    @app.post("/admin/v1/approvals/{approval_id}/decision")
+    async def decide(approval_id: str, body: DecisionRequest):
+        return await service.approvals.decide(approval_id, body.decision)
 
     return app

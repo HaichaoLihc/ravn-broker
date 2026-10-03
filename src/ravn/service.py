@@ -14,11 +14,13 @@ from datetime import UTC, datetime, timedelta
 from mcp import types
 
 from ravn import control
+from ravn.approvals import Approvals, quietly
 from ravn.common import Principal, RavnError, canonical, digest, identifier, now, token
 from ravn.config import Config
 from ravn.crypto import Cipher
 from ravn.github import GitHub
 from ravn.gmail import Gmail
+from ravn.gmail_api import GmailApi
 from ravn.manifest import check_schema, is_write, schema_hash, schemas_for, validate_arguments
 from ravn.oauth import Onboarding
 from ravn.permissions import effective_tools, session_rules
@@ -94,15 +96,20 @@ class Service:
         self.providers.setdefault(
             "gmail", Gmail(config.limits.call_timeout_seconds, config.limits.result_bytes)
         )
+        self.providers.setdefault(
+            "gmail_api", GmailApi(config.limits.call_timeout_seconds, config.limits.result_bytes)
+        )
         self.provider = self.providers["github_cloud"]  # Backward-compatible test/inspection hook.
         self.oauth = Onboarding(self)
         self.oauth_sweeper = None
         self.ready = False
         self.counts = Counter()
         self.cursors = {}
+        self.approvals = Approvals(self)
 
     async def start(self):
         await self.store.open()
+        await self.approvals.recover()
         await self.oauth.cleanup()
         self.oauth_sweeper = asyncio.create_task(self.oauth.sweep())
         self.ready = True
@@ -536,108 +543,121 @@ class Service:
                 replay = await self.previous_call(db, p, key_hash, fingerprint, request_id)
             if replay:
                 return replay
+        approval = (
+            await self.approvals.wait(p, cid, name, arguments, fingerprint) if write else None
+        )
         call_id, admitted, started = identifier("call"), False, time.monotonic()
-        async with self.slots(p, cid):
-            credential, integration = await self.credential(p, cid)
+        try:
+            async with self.slots(p, cid):
+                credential, integration = await self.credential(p, cid)
 
-            async def admit():
-                nonlocal admitted
-                async with self.store.transaction() as db:
-                    await self.authorize(db, p, cid, execute=True, tool=name)
-                    # Transactions are serialized, so a concurrent duplicate that
-                    # passed the early check is caught here, before dispatch.
-                    if key_hash and (
-                        replay := await self.previous_call(db, p, key_hash, fingerprint, request_id)
-                    ):
-                        raise Replayed(replay)
-                    stamp = now()
-                    await db.execute(
-                        "INSERT INTO calls(id,app_id,tenant_id,user_id,connection_id,session_id,tool,"
-                        "status,arguments_fingerprint,fingerprint_key_id,error_code,duration_ms,"
-                        "created_at,updated_at,completed_at,effect,idempotency_key_hash) "
-                        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                        (
-                            call_id,
-                            *p.namespace,
-                            cid,
-                            p.session_id,
-                            name,
-                            "running",
-                            fingerprint,
-                            self.cipher.key_id,
-                            None,
-                            None,
-                            stamp,
-                            stamp,
-                            None,
-                            "write" if write else "read",
-                            key_hash,
-                        ),
-                    )
+                async def admit():
+                    nonlocal admitted
+                    async with self.store.transaction() as db:
+                        await self.authorize(db, p, cid, execute=True, tool=name)
+                        # Transactions are serialized, so a concurrent duplicate that
+                        # passed the early check is caught here, before dispatch.
+                        if key_hash and (
+                            replay := await self.previous_call(
+                                db, p, key_hash, fingerprint, request_id
+                            )
+                        ):
+                            raise Replayed(replay)
+                        stamp = now()
+                        await db.execute(
+                            "INSERT INTO calls(id,app_id,tenant_id,user_id,connection_id,session_id,tool,"
+                            "status,arguments_fingerprint,fingerprint_key_id,error_code,duration_ms,"
+                            "created_at,updated_at,completed_at,effect,idempotency_key_hash) "
+                            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                            (
+                                call_id,
+                                *p.namespace,
+                                cid,
+                                p.session_id,
+                                name,
+                                "running",
+                                fingerprint,
+                                self.cipher.key_id,
+                                None,
+                                None,
+                                stamp,
+                                stamp,
+                                None,
+                                "write" if write else "read",
+                                key_hash,
+                            ),
+                        )
+                        if approval:
+                            await self.approvals.consume(db, p, approval, fingerprint, call_id)
+                        await event(db, p, "call.admitted", call_id)
+                    # Only once committed: a rollback leaves no calls row and no consumed approval.
                     admitted = True
-                    await event(db, p, "call.admitted", call_id)
 
-            try:
-                result = await self.provider_for(integration).call(
-                    credential, integration, name, arguments, admit
-                )
-                if not admitted:
-                    raise RuntimeError("Provider bypassed dispatch admission")
-                raw = result.model_dump(mode="json", by_alias=True, exclude_none=True)
-                if (
-                    credential in canonical(raw).decode()
-                    or len(canonical(raw)) > self.config.limits.result_bytes
-                ):
-                    raise RavnError(
-                        502, "upstream_unavailable", "Unsafe or oversized result was withheld."
+                try:
+                    result = await self.provider_for(integration).call(
+                        credential, integration, name, arguments, admit
                     )
-                await self.finish_call(
-                    p, call_id, "tool_error" if result.is_error else "succeeded", None, started
-                )
-                result.meta = {
-                    **(result.meta or {}),
-                    "ravn/call-id": call_id,
-                    "ravn/request-id": request_id,
-                }
-                return result
-            except BaseException as exc:
-                if isinstance(exc, Replayed):
-                    return exc.result
-                if isinstance(exc, RavnError) and exc.code == "credential_invalid":
-                    await self.oauth.rejected(p, cid, credential)
-                # After dispatch, a write only definitely did not happen when the
-                # provider refused the request itself. Everything else is ambiguous.
-                ambiguous = write and not (
-                    isinstance(exc, RavnError) and exc.code in DEFINITE_REFUSALS
-                )
-                if admitted:
-                    code = exc.code if isinstance(exc, RavnError) else "upstream_unavailable"
-                    status = "failed"
-                    if ambiguous:
-                        status, code = "unknown", "outcome_unknown"
-                    elif isinstance(exc, asyncio.CancelledError):
-                        status = "unknown"
-                    await finish(self.finish_call(p, call_id, status, code, started))
-                if isinstance(exc, asyncio.CancelledError):
-                    raise
-                if admitted and ambiguous:
-                    raise RavnError(
-                        502,
-                        "outcome_unknown",
-                        "The write may have executed. Reconcile before trying again; nothing was retried.",
-                        call_id=call_id,
-                    ) from None
-                if isinstance(exc, RavnError):
-                    # Keep a call ID set by an earlier keyed call; never invent one.
+                    if not admitted:
+                        raise RuntimeError("Provider bypassed dispatch admission")
+                    raw = result.model_dump(mode="json", by_alias=True, exclude_none=True)
+                    if (
+                        credential in canonical(raw).decode()
+                        or len(canonical(raw)) > self.config.limits.result_bytes
+                    ):
+                        raise RavnError(
+                            502, "upstream_unavailable", "Unsafe or oversized result was withheld."
+                        )
+                    await self.finish_call(
+                        p, call_id, "tool_error" if result.is_error else "succeeded", None, started
+                    )
+                    result.meta = {
+                        **(result.meta or {}),
+                        "ravn/call-id": call_id,
+                        "ravn/request-id": request_id,
+                    }
+                    return result
+                except BaseException as exc:
+                    if isinstance(exc, Replayed):
+                        return exc.result
+                    if isinstance(exc, RavnError) and exc.code == "credential_invalid":
+                        await self.oauth.rejected(p, cid, credential)
+                    # After dispatch, a write only definitely did not happen when the
+                    # provider refused the request itself. Everything else is ambiguous.
+                    ambiguous = write and not (
+                        isinstance(exc, RavnError) and exc.code in DEFINITE_REFUSALS
+                    )
                     if admitted:
-                        exc.call_id = call_id
-                    raise
-                raise RavnError(
-                    503,
-                    "dependency_unavailable",
-                    "Tool call could not complete.",
-                    call_id=call_id if admitted else None,
-                ) from None
+                        code = exc.code if isinstance(exc, RavnError) else "upstream_unavailable"
+                        status = "failed"
+                        if ambiguous:
+                            status, code = "unknown", "outcome_unknown"
+                        elif isinstance(exc, asyncio.CancelledError):
+                            status = "unknown"
+                        await finish(self.finish_call(p, call_id, status, code, started))
+                    if isinstance(exc, asyncio.CancelledError):
+                        raise
+                    if admitted and ambiguous:
+                        raise RavnError(
+                            502,
+                            "outcome_unknown",
+                            "The write may have executed. Reconcile before trying again; nothing was retried.",
+                            call_id=call_id,
+                        ) from None
+                    if isinstance(exc, RavnError):
+                        # Keep a call ID set by an earlier keyed call; never invent one.
+                        if admitted:
+                            exc.call_id = call_id
+                        raise
+                    raise RavnError(
+                        503,
+                        "dependency_unavailable",
+                        "Tool call could not complete.",
+                        call_id=call_id if admitted else None,
+                    ) from None
+        finally:
+            # An approval is single-use: one this call did not consume dies with it.
+            if approval and not admitted:
+                await quietly(self.approvals.release(p, approval))
 
     async def finish_call(self, p, call_id, status, code, started):
         async with self.store.transaction() as db:

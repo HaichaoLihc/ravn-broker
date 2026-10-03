@@ -7,19 +7,24 @@ import contextlib
 import json
 import logging
 import os
+import threading
 import webbrowser
+from datetime import UTC, datetime
 from pathlib import Path
+from urllib.parse import quote
 
 import httpx
 import uvicorn
 import yaml
 
 from ravn.app import create_admin_app, create_app
+from ravn.approvals import clean
 from ravn.common import RavnError, canonical
 from ravn.config import load_config
 from ravn.crypto import private_file
 from ravn.github import GitHub
 from ravn.gmail import Gmail
+from ravn.gmail_api import GmailApi
 from ravn.manifest import check_schema, schema_hash, schemas_for
 from ravn.slack import Slack
 
@@ -157,17 +162,160 @@ async def serve(config, *, console_enabled=False, console_port=8788):
                 console.close()
 
 
-async def admin_request(config, path, payload):
+async def admin_request(config, path, payload=None, method="POST", seconds=10):
     async with httpx.AsyncClient(
         transport=httpx.AsyncHTTPTransport(uds=str(config.server.admin_socket)),
         base_url="http://ravn-admin",
         trust_env=False,
-        timeout=10,
+        timeout=seconds,
     ) as client:
-        response = await client.post(path, json=payload)
+        response = await client.request(method, path, json=payload if method != "GET" else None)
+        if response.status_code in {404, 409}:
+            # Fixed server strings, never upstream text, so they are safe to show.
+            error = response.json().get("error")
+            if not isinstance(error, dict):
+                raise RavnError(404, "not_found", "Not found; is the broker up to date?")
+            raise RavnError(response.status_code, error["code"], error["message"])
         if response.is_error:
             raise ValueError("Operator request failed")
         return response.json()
+
+
+# Short fields that decide where a write goes come first, so a long body can
+# never push them out of view.
+FIRST = ("to", "cc", "bcc", "subject", "replyToMessageId")
+VALUE_LIMIT = 2000
+
+
+def render_arguments(raw) -> list[str]:
+    try:
+        arguments = json.loads(raw)
+    except (TypeError, ValueError):
+        arguments = None
+    if not isinstance(arguments, dict):
+        return ["    " + clean(str(raw), 4000).replace("\n", "\n    ")]
+    keys = [k for k in FIRST if k in arguments]
+    keys += sorted(k for k in arguments if k not in FIRST)
+    lines, cut = [], False
+    for key in keys:
+        value = arguments[key]
+        items = value if isinstance(value, list) else [value]
+        texts = []
+        for item in items:
+            text = item if isinstance(item, str) else json.dumps(item, ensure_ascii=False, indent=2)
+            text = clean(text, len(text))
+            # Where a write goes is never cut; the manifest already bounds those fields.
+            if key not in FIRST and len(text) > VALUE_LIMIT:
+                cut = True
+                text = f"{text[:VALUE_LIMIT]}\n... [truncated, {len(text)} chars total]"
+            texts.append(text)
+        if isinstance(value, list):
+            text = "".join("\n- " + t for t in texts) if texts else "[]"
+        else:
+            text = texts[0]
+        lines.append(f"    {clean(key, 256)}: " + text.replace("\n", "\n      "))
+    if not keys:
+        lines.append("    (none)")
+    if cut:
+        lines.append("    ! Some values are truncated; every argument is listed above.")
+    return lines
+
+
+def render(item) -> str:
+    def field(key):
+        return clean(str(item.get(key)), 256)
+
+    try:
+        stamp = datetime.now(UTC)
+        age = int((stamp - datetime.fromisoformat(item["created_at"])).total_seconds())
+        left = int((datetime.fromisoformat(item["expires_at"]) - stamp).total_seconds())
+        timing = f"{max(age, 0)}s ago, {max(left, 0)}s left"
+    except (KeyError, TypeError, ValueError):
+        timing = "unknown"
+    return "\n".join(
+        [
+            f"Approval {field('id')}",
+            f"  tool:       {field('tool')}",
+            f"  app:        {field('app_id')} (tenant {field('tenant_id')})",
+            f"  user:       {field('user_id')}",
+            f"  session:    {field('session_id')}",
+            f"  connection: {field('connection_id')}",
+            f"  requested:  {timing}",
+            "  arguments:",
+            *render_arguments(item.get("arguments")),
+        ]
+    )
+
+
+async def prompt(text):
+    """Read a line without tying shutdown to a blocked worker thread."""
+    loop = asyncio.get_running_loop()
+    future = loop.create_future()
+
+    def settle(outcome, value):
+        if not future.done():
+            future.set_exception(value) if outcome == "error" else future.set_result(value)
+
+    def read():
+        try:
+            value = input(text)
+        except BaseException as error:
+            loop.call_soon_threadsafe(settle, "error", error)
+        else:
+            loop.call_soon_threadsafe(settle, "ok", value)
+
+    threading.Thread(target=read, daemon=True).start()
+    return await future
+
+
+async def approvals_command(config, args):
+    if args.action in {"approve", "deny"}:
+        await admin_request(
+            config,
+            f"/admin/v1/approvals/{quote(args.id, safe='')}/decision",
+            {"decision": args.action},
+        )
+        print(f"{'Approved' if args.action == 'approve' else 'Denied'} {clean(args.id, 256)}.")
+        return
+    if args.action == "list":
+        result = await admin_request(config, "/admin/v1/approvals?wait=0", method="GET")
+        if not result["data"]:
+            print("No pending approvals.")
+        for item in result["data"]:
+            print(render(item) + "\n")
+        return
+    print("Waiting for write approvals. Press Ctrl-C to stop; undecided requests stay pending.")
+    version, seen = None, set()
+    while True:
+        result = await admin_request(
+            config,
+            "/admin/v1/approvals?wait=25" + (f"&after={version}" if version is not None else ""),
+            method="GET",
+            seconds=40,
+        )
+        version = result["version"]
+        seen &= {item["id"] for item in result["data"]}
+        for item in result["data"]:
+            if item["id"] in seen:
+                continue
+            seen.add(item["id"])
+            print("\a" + render(item))
+            try:
+                choice = (await prompt("[a]pprove / [d]eny / [s]kip: ")).strip().lower()
+            except EOFError:
+                return
+            if choice not in {"a", "d"}:
+                continue
+            decision = "approve" if choice == "a" else "deny"
+            try:
+                await admin_request(
+                    config,
+                    f"/admin/v1/approvals/{quote(item['id'], safe='')}/decision",
+                    {"decision": decision},
+                )
+                print("Approved.\n" if decision == "approve" else "Denied.\n")
+            except RavnError:
+                print("Already decided or expired.\n")
 
 
 async def backend_request(config, args, method, path, payload=None):
@@ -210,6 +358,9 @@ async def run(args):
     if args.command == "config-check":
         print("Configuration is valid; no external requests were made.")
         return
+    if args.command == "approvals":
+        await approvals_command(config, args)
+        return
     if args.command == "integration-inspect":
         if args.connection:
             if not args.app_key_file or not args.user:
@@ -227,9 +378,9 @@ async def run(args):
         if integration is None or not integration.enabled:
             raise ValueError("Integration not found or disabled")
         credential = private_file(args.token_file).decode()
-        provider = {"slack": Slack, "gmail": Gmail}.get(integration.connector, GitHub)(
-            config.limits.call_timeout_seconds, config.limits.result_bytes
-        )
+        provider = {"slack": Slack, "gmail": Gmail, "gmail_api": GmailApi}.get(
+            integration.connector, GitHub
+        )(config.limits.call_timeout_seconds, config.limits.result_bytes)
         await provider.identify(credential)
         tools = await provider.inspect(credential)
         result = {"schema_hashes": {}, "schemas_for_review": {}}
@@ -348,6 +499,15 @@ def parser():
         action="store_true",
         help="Print the short-lived sign-in link instead of opening it",
     )
+    approve = sub.add_parser("approvals", help="Approve or deny pending writes")
+    config(approve)
+    acts = approve.add_subparsers(dest="action")
+    # Accepted after the action too; SUPPRESS keeps a child default from erasing the parent's.
+    for action in ("list", "approve", "deny"):
+        child = acts.add_parser(action)
+        child.add_argument("--config", type=Path, default=argparse.SUPPRESS)
+        if action != "list":
+            child.add_argument("id")
     inspect = sub.add_parser(
         "integration-inspect", help="Inspect candidate schemas; does not approve or save pins"
     )

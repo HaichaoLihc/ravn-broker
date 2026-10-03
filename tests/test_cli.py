@@ -14,6 +14,9 @@ from pathlib import Path
 import httpx
 import pytest
 
+from ravn.approvals import clean
+from ravn.cli import render
+
 
 def cli(*args):
     return subprocess.run(
@@ -73,6 +76,18 @@ def test_cli_init_serve_admin_and_backend(with_console):
                 assert stat.S_IMODE((root / "state").stat().st_mode) == 0o700
                 assert client.get("/healthz").status_code == 200
                 assert client.post("/admin/v1/app-keys", json={}).status_code == 404
+                assert cli("approvals", "--config", config, "list").stdout == (
+                    "No pending approvals.\n"
+                )
+                decided = subprocess.run(
+                    [sys.executable, "-m", "ravn.cli", "approvals", "--config", str(config)]
+                    + ["approve", "apr_missing"],
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                )
+                assert decided.returncode == 1
+                assert decided.stdout.startswith("not_found:")
                 assert client.get("/v1/connections").status_code == 401
                 result = cli(
                     "connections",
@@ -121,3 +136,64 @@ def test_cli_init_serve_admin_and_backend(with_console):
             assert ticket not in stdout + stderr
         assert "Traceback" not in stderr
         assert os.stat(root / "state/ravn.db").st_mode & 0o077 == 0
+
+
+HOSTILE = (
+    "a\x1b[31mred\x1b[0m"
+    "\x1b]52;c;cGF5bG9hZA==\x07"
+    "\x1b]8;;http://x\x1b\\link\x1b]8;;\x1b\\"
+    "\rover\x07\x9b2J\u202eevil\u200bz"
+    "\n\tkept\x1b"
+)
+
+
+def test_clean_strips_every_terminal_control():
+    text = clean(HOSTILE, 1000)
+    assert text == "aredlinkover2Jevilz\n\tkept"
+    assert not any(c in text for c in "\x1b\r\x07\x9b\u202e\u200b")
+    long = clean("x" * 10000, 4000)
+    assert long.endswith("[truncated]") and len(long) < 4100
+
+
+def test_render_never_passes_escapes_through():
+    item = {
+        key: HOSTILE
+        for key in (
+            "id",
+            "app_id",
+            "tenant_id",
+            "user_id",
+            "session_id",
+            "connection_id",
+            "tool",
+            "arguments",
+        )
+    }
+    item |= {"created_at": "2026-01-01T00:00:00.000000Z", "expires_at": HOSTILE}
+    text = render(item)
+    assert "\x1b" not in text and "\r" not in text and "\x9b" not in text
+    assert "kept" in text and "requested:  unknown" in text
+
+
+def test_render_shows_every_argument_when_a_value_is_long():
+    arguments = {
+        "body": "b" * 10000,
+        "cc": "boss@example.com",
+        "subject": "Quarterly numbers",
+        "to": "attacker@example.com",
+    }
+    item = {"id": "a1", "tool": "create_draft", "arguments": json.dumps(arguments)}
+    text = render(item)
+    assert "to: attacker@example.com" in text
+    assert "cc: boss@example.com" in text and "subject: Quarterly numbers" in text
+    # Recipients come before the long body, and the cut says how much was hidden.
+    assert text.index("to: attacker") < text.index("body: ")
+    assert "[truncated, 10000 chars total]" in text and "b" * 10000 not in text
+
+
+def test_render_never_cuts_recipients():
+    padding = [f"{'x' * 240}{i}@example.com" for i in range(19)]
+    arguments = {"to": [*padding, "real-target@example.com"], "subject": "Hi", "body": "b"}
+    text = render({"id": "a1", "tool": "create_draft", "arguments": json.dumps(arguments)})
+    assert "- real-target@example.com" in text and "truncated" not in text
+    assert all(f"- {address}" in text for address in padding)
